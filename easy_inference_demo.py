@@ -37,9 +37,24 @@ def main(args):
         if args.test_mode == '4s':
             audio = pad(audio, 64000)
         x = torch.tensor(audio).unsqueeze(0).to(device)
-        pred = model(x)[:, 1]
-        print('score:', pred.item())
+        # pred = model(x)[:, 1]
+        # print('score:', pred.item())
+        logits = model(x)
+        prob = torch.softmax(logits, dim=1)[0]
 
+        fake_score = logits[0, 0].item()
+        real_score = logits[0, 1].item()
+
+        fake_prob = prob[0].item()
+        real_prob = prob[1].item()
+
+        label = "real" if real_prob >= fake_prob else "fake"
+
+        print("fake_score:", fake_score)
+        print("real_score:", real_score)
+        print("fake_prob:", fake_prob)
+        print("real_prob:", real_prob)
+        print("result:", label) # 여기까지 내가 수정
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()

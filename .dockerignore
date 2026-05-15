@@ -1,0 +1,10 @@
+.git
+__pycache__
+*.pyc
+logs
+database
+samples
+checkpoints
+*.pt
+*.pth
+xlsr2_300m.pt
