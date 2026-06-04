@@ -30,6 +30,7 @@ RUN grep -v "^torch==" requirements.txt | grep -v "^torchaudio==" > requirements
 COPY inference.py /workspace/inference.py
 COPY worker.py /workspace/worker.py
 COPY config.py /workspace/config.py
+COPY metrics.py /workspace/metrics.py
 COPY model_downloader.py /workspace/model_downloader.py
 COPY s3_client.py /workspace/s3_client.py
 COPY sqs_client.py /workspace/sqs_client.py
