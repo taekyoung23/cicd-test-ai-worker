@@ -43,4 +43,6 @@ COPY RawBoost.py /workspace/RawBoost.py
 RUN cd /workspace/fairseq_src && \
     pip install --no-cache-dir --editable ./
 
+EXPOSE 9100
+
 CMD ["python", "-u", "worker.py"]

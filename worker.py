@@ -1,6 +1,7 @@
 import json
 import traceback
 from datetime import datetime, timezone
+from metrics import start_metrics_server_if_enabled
 
 from config import (
     LOCAL_AUDIO_PATH,
@@ -220,6 +221,8 @@ def run_aws():
 
 
 if __name__ == "__main__":
+    start_metrics_server_if_enabled()
+
     print(f"[WORKER] entrypoint WORKER_MODE={WORKER_MODE}", flush=True)
 
     if is_mock_mode():
