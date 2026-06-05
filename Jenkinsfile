@@ -99,6 +99,45 @@ pipeline {
             }
         }
 
+        stage('Docker Image Smoke Test') {
+            steps {
+                sh '''
+                    set -eu
+
+                    docker run --rm -i \
+                      -e APP_ENV="${APP_ENV}" \
+                      -e WORKER_MODE="${WORKER_MODE}" \
+                      -e AWS_REGION="${AWS_REGION}" \
+                      -e MODEL_DIR="${MODEL_DIR}" \
+                      -e MODEL_PATH="${MODEL_PATH}" \
+                      -e LOCAL_AUDIO_PATH="${LOCAL_AUDIO_PATH}" \
+                      "${IMAGE_URI}" \
+                      python healthcheck.py
+
+                    docker run --rm -i \
+                      -e APP_ENV="${APP_ENV}" \
+                      -e WORKER_MODE="${WORKER_MODE}" \
+                      -e AWS_REGION="${AWS_REGION}" \
+                      -e MODEL_DIR="${MODEL_DIR}" \
+                      -e MODEL_PATH="${MODEL_PATH}" \
+                      -e LOCAL_AUDIO_PATH="${LOCAL_AUDIO_PATH}" \
+                      "${IMAGE_URI}" \
+                      python - <<'PY'
+import config
+import db_client
+import healthcheck
+import inference
+import model_downloader
+import s3_client
+import sqs_client
+import worker
+
+print("worker image import smoke test passed")
+PY
+                '''
+            }
+        }
+
         stage('ECR Login') {
             when {
                 expression { return params.PUSH_IMAGE }
