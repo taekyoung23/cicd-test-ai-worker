@@ -63,12 +63,12 @@ pipeline {
                       model_scripts
                     python3 healthcheck.py
                     if [ "${RUN_PYTEST}" = "true" ]; then
-                      if find . -maxdepth 3 -type f \\( -name "test_*.py" -o -name "*_test.py" \\) | grep -q .; then
+                      if find . -path ./fairseq_src -prune -o -maxdepth 3 -type f \\( -name "test_*.py" -o -name "*_test.py" \\) -print | grep -q .; then
                         python3 -m venv .venv
                         . .venv/bin/activate
                         python -m pip install --upgrade pip setuptools wheel
                         pip install pytest
-                        pytest
+                        pytest --ignore=fairseq_src
                       else
                         echo "No pytest test files found. Skipping pytest."
                       fi
