@@ -254,6 +254,18 @@ PY
                 // 안정화 대기 전에 Free Worker Service Update를 한 번만 실행합니다.
                 sh '''
                     set -eu
+                    CIRCUIT_BREAKER="$(aws ecs describe-services \
+                      --region "${AWS_REGION}" \
+                      --cluster "${ECS_CLUSTER_NAME}" \
+                      --services "${FREE_ECS_SERVICE_NAME}" \
+                      --query 'services[0].deploymentConfiguration.deploymentCircuitBreaker.[enable,rollback]' \
+                      --output text)"
+
+                    if ! printf '%s\n' "${CIRCUIT_BREAKER}" | awk '$1 == "True" && $2 == "True" { enabled = 1 } END { exit !enabled }'; then
+                      echo "Free Worker deployment circuit breaker with rollback must be enabled before deployment: ${CIRCUIT_BREAKER}"
+                      exit 1
+                    fi
+
                     aws ecs update-service \
                       --region "${AWS_REGION}" \
                       --cluster "${ECS_CLUSTER_NAME}" \
@@ -274,16 +286,49 @@ PY
             steps {
                 sh '''
                     set -eu
+                    WAIT_EXIT=0
+                    set +e
                     aws ecs wait services-stable \
                       --region "${AWS_REGION}" \
                       --cluster "${ECS_CLUSTER_NAME}" \
-                      --services "${FREE_ECS_SERVICE_NAME}"
+                      --services "${FREE_ECS_SERVICE_NAME}" || WAIT_EXIT=$?
+                    set -e
+
                     aws ecs describe-services \
                       --region "${AWS_REGION}" \
                       --cluster "${ECS_CLUSTER_NAME}" \
                       --services "${FREE_ECS_SERVICE_NAME}" \
-                      --query 'services[0].events[0:5].[createdAt,message]' \
+                      --query 'services[0].deployments[].{Status:status,RolloutState:rolloutState,TaskDefinition:taskDefinition,Desired:desiredCount,Running:runningCount,Failed:failedTasks}' \
                       --output table
+
+                    aws ecs describe-services \
+                      --region "${AWS_REGION}" \
+                      --cluster "${ECS_CLUSTER_NAME}" \
+                      --services "${FREE_ECS_SERVICE_NAME}" \
+                      --query 'services[0].events[0:10].[createdAt,message]' \
+                      --output table
+
+                    FINAL_FREE_TASK_DEFINITION_ARN="$(aws ecs describe-services \
+                      --region "${AWS_REGION}" \
+                      --cluster "${ECS_CLUSTER_NAME}" \
+                      --services "${FREE_ECS_SERVICE_NAME}" \
+                      --query 'services[0].taskDefinition' \
+                      --output text)"
+
+                    echo "Requested Free Worker task definition: ${FREE_TASK_DEFINITION_ARN}"
+                    echo "Final Free Worker task definition: ${FINAL_FREE_TASK_DEFINITION_ARN}"
+
+                    if [ "${WAIT_EXIT}" -ne 0 ]; then
+                      echo "Free Worker did not reach stable state. Paid Worker deployment will not start."
+                      exit "${WAIT_EXIT}"
+                    fi
+
+                    if [ "${FINAL_FREE_TASK_DEFINITION_ARN}" != "${FREE_TASK_DEFINITION_ARN}" ]; then
+                      echo "Requested Free Worker revision is not active. ECS Circuit Breaker rollback or another service update occurred."
+                      echo "Paid Worker deployment will not start."
+                      exit 1
+                    fi
+
                     echo "Free Worker service is stable: ${FREE_ECS_SERVICE_NAME}"
                 '''
             }
@@ -298,6 +343,20 @@ PY
             steps {
                 sh '''
                     set -eu
+
+                    FINAL_FREE_TASK_DEFINITION_ARN="$(aws ecs describe-services \
+                      --region "${AWS_REGION}" \
+                      --cluster "${ECS_CLUSTER_NAME}" \
+                      --services "${FREE_ECS_SERVICE_NAME}" \
+                      --query 'services[0].taskDefinition' \
+                      --output text)"
+
+                    if [ "${FINAL_FREE_TASK_DEFINITION_ARN}" != "${FREE_TASK_DEFINITION_ARN}" ]; then
+                      echo "Free Worker service revision changed before post-deploy verification completed."
+                      echo "Requested task definition: ${FREE_TASK_DEFINITION_ARN}"
+                      echo "Final service task definition: ${FINAL_FREE_TASK_DEFINITION_ARN}"
+                      exit 1
+                    fi
 
                     FREE_RUNNING_TASK_ARNS="$(aws ecs list-tasks \
                       --region "${AWS_REGION}" \
@@ -426,6 +485,18 @@ PY
                 // Free와 Paid Worker Service 모두 동일한 IMAGE_URI를 사용합니다.
                 sh '''
                     set -eu
+                    CIRCUIT_BREAKER="$(aws ecs describe-services \
+                      --region "${AWS_REGION}" \
+                      --cluster "${ECS_CLUSTER_NAME}" \
+                      --services "${PAID_ECS_SERVICE_NAME}" \
+                      --query 'services[0].deploymentConfiguration.deploymentCircuitBreaker.[enable,rollback]' \
+                      --output text)"
+
+                    if ! printf '%s\n' "${CIRCUIT_BREAKER}" | awk '$1 == "True" && $2 == "True" { enabled = 1 } END { exit !enabled }'; then
+                      echo "Paid Worker deployment circuit breaker with rollback must be enabled before deployment: ${CIRCUIT_BREAKER}"
+                      exit 1
+                    fi
+
                     aws ecs update-service \
                       --region "${AWS_REGION}" \
                       --cluster "${ECS_CLUSTER_NAME}" \
@@ -447,16 +518,55 @@ PY
             steps {
                 sh '''
                     set -eu
+                    WAIT_EXIT=0
+                    set +e
                     aws ecs wait services-stable \
                       --region "${AWS_REGION}" \
                       --cluster "${ECS_CLUSTER_NAME}" \
-                      --services "${PAID_ECS_SERVICE_NAME}"
+                      --services "${PAID_ECS_SERVICE_NAME}" || WAIT_EXIT=$?
+                    set -e
+
                     aws ecs describe-services \
                       --region "${AWS_REGION}" \
                       --cluster "${ECS_CLUSTER_NAME}" \
                       --services "${PAID_ECS_SERVICE_NAME}" \
-                      --query 'services[0].events[0:5].[createdAt,message]' \
+                      --query 'services[0].deployments[].{Status:status,RolloutState:rolloutState,TaskDefinition:taskDefinition,Desired:desiredCount,Running:runningCount,Failed:failedTasks}' \
                       --output table
+
+                    aws ecs describe-services \
+                      --region "${AWS_REGION}" \
+                      --cluster "${ECS_CLUSTER_NAME}" \
+                      --services "${PAID_ECS_SERVICE_NAME}" \
+                      --query 'services[0].events[0:10].[createdAt,message]' \
+                      --output table
+
+                    FINAL_PAID_TASK_DEFINITION_ARN="$(aws ecs describe-services \
+                      --region "${AWS_REGION}" \
+                      --cluster "${ECS_CLUSTER_NAME}" \
+                      --services "${PAID_ECS_SERVICE_NAME}" \
+                      --query 'services[0].taskDefinition' \
+                      --output text)"
+
+                    echo "Requested Paid Worker task definition: ${PAID_TASK_DEFINITION_ARN}"
+                    echo "Final Paid Worker task definition: ${FINAL_PAID_TASK_DEFINITION_ARN}"
+
+                    if [ "${WAIT_EXIT}" -ne 0 ]; then
+                      echo "Paid Worker did not reach stable state."
+                      exit "${WAIT_EXIT}"
+                    fi
+
+                    if [ "${FINAL_PAID_TASK_DEFINITION_ARN}" != "${PAID_TASK_DEFINITION_ARN}" ]; then
+                      echo "Requested Paid Worker revision is not active. ECS Circuit Breaker rollback or another service update occurred."
+                      aws ecs describe-services \
+                        --region "${AWS_REGION}" \
+                        --cluster "${ECS_CLUSTER_NAME}" \
+                        --services "${FREE_ECS_SERVICE_NAME}" "${PAID_ECS_SERVICE_NAME}" \
+                        --query 'services[].{Service:serviceName,TaskDefinition:taskDefinition,Desired:desiredCount,Running:runningCount}' \
+                        --output table
+                      echo "Free Worker may already use the new image while Paid Worker was rolled back. Review both services before the next deployment."
+                      exit 1
+                    fi
+
                     echo "Paid Worker service is stable: ${PAID_ECS_SERVICE_NAME}"
                 '''
             }
@@ -471,6 +581,20 @@ PY
             steps {
                 sh '''
                     set -eu
+
+                    FINAL_PAID_TASK_DEFINITION_ARN="$(aws ecs describe-services \
+                      --region "${AWS_REGION}" \
+                      --cluster "${ECS_CLUSTER_NAME}" \
+                      --services "${PAID_ECS_SERVICE_NAME}" \
+                      --query 'services[0].taskDefinition' \
+                      --output text)"
+
+                    if [ "${FINAL_PAID_TASK_DEFINITION_ARN}" != "${PAID_TASK_DEFINITION_ARN}" ]; then
+                      echo "Paid Worker service revision changed before post-deploy verification completed."
+                      echo "Requested task definition: ${PAID_TASK_DEFINITION_ARN}"
+                      echo "Final service task definition: ${FINAL_PAID_TASK_DEFINITION_ARN}"
+                      exit 1
+                    fi
 
                     PAID_RUNNING_TASK_ARNS="$(aws ecs list-tasks \
                       --region "${AWS_REGION}" \
