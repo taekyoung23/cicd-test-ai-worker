@@ -485,7 +485,7 @@ PY
                       exit 1
                     fi
 
-                    if [ "${ROLLBACK_TEST_MODE}" = "FREE_VERIFY_FAIL" ]; then
+                    if [ "${ROLLBACK_TEST_MODE:-NONE}" = "FREE_VERIFY_FAIL" ]; then
                       echo "Intentional Free Worker verification failure for rollback test."
                       exit 1
                     fi
@@ -741,7 +741,7 @@ PY
                       exit 1
                     fi
 
-                    if [ "${ROLLBACK_TEST_MODE}" = "PAID_VERIFY_FAIL" ]; then
+                    if [ "${ROLLBACK_TEST_MODE:-NONE}" = "PAID_VERIFY_FAIL" ]; then
                       echo "Intentional Paid Worker verification failure for rollback test."
                       exit 1
                     fi
