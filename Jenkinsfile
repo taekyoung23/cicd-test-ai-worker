@@ -11,6 +11,14 @@ pipeline {
         timeout(time: 45, unit: 'MINUTES')
     }
 
+    parameters {
+        choice(
+            name: 'ROLLBACK_TEST_MODE',
+            choices: ['NONE', 'FREE_VERIFY_FAIL', 'PAID_VERIFY_FAIL'],
+            description: 'Worker automatic rollback verification only'
+        )
+    }
+
     environment {
         DOCKER_BUILDKIT = '1'
         APP_ENV = 'ci'
@@ -37,6 +45,9 @@ pipeline {
                 checkout scm
                 sh 'git submodule update --init --recursive'
                 script {
+                    env.FREE_UPDATE_REQUESTED = 'false'
+                    env.PAID_UPDATE_REQUESTED = 'false'
+                    env.DEPLOY_PHASE = 'PRE_DEPLOY'
                     // 전체 SHA는 배포 추적용으로, 짧은 SHA는 이미지 태그용으로 저장합니다.
                     env.GIT_COMMIT_SHA = sh(
                         script: 'git rev-parse HEAD',
@@ -190,6 +201,109 @@ PY
             }
         }
 
+        // 롤백 대상은 단순 이전 번호가 아니라 배포 직전 각 Service가 실제 사용하던 Revision입니다.
+        stage('Capture Worker Deployment Baseline') {
+            steps {
+                script {
+                    env.FREE_PREVIOUS_TASK_DEFINITION_ARN = sh(
+                        script: '''
+                            set -eu
+                            aws ecs describe-services \
+                              --region "${AWS_REGION}" \
+                              --cluster "${ECS_CLUSTER_NAME}" \
+                              --services "${FREE_ECS_SERVICE_NAME}" \
+                              --query 'services[0].taskDefinition' \
+                              --output text
+                        ''',
+                        returnStdout: true
+                    ).trim()
+                    env.PAID_PREVIOUS_TASK_DEFINITION_ARN = sh(
+                        script: '''
+                            set -eu
+                            aws ecs describe-services \
+                              --region "${AWS_REGION}" \
+                              --cluster "${ECS_CLUSTER_NAME}" \
+                              --services "${PAID_ECS_SERVICE_NAME}" \
+                              --query 'services[0].taskDefinition' \
+                              --output text
+                        ''',
+                        returnStdout: true
+                    ).trim()
+                    if (!env.FREE_PREVIOUS_TASK_DEFINITION_ARN || env.FREE_PREVIOUS_TASK_DEFINITION_ARN == 'None') {
+                        error('Unable to capture the Free Worker rollback baseline task definition.')
+                    }
+                    if (!env.PAID_PREVIOUS_TASK_DEFINITION_ARN || env.PAID_PREVIOUS_TASK_DEFINITION_ARN == 'None') {
+                        error('Unable to capture the Paid Worker rollback baseline task definition.')
+                    }
+                    env.FREE_PREVIOUS_IMAGE_URI = sh(
+                        script: '''
+                            set -eu
+                            aws ecs describe-task-definition \
+                              --region "${AWS_REGION}" \
+                              --task-definition "${FREE_PREVIOUS_TASK_DEFINITION_ARN}" \
+                              --query "taskDefinition.containerDefinitions[?name=='${FREE_CONTAINER_NAME}'].image | [0]" \
+                              --output text
+                        ''',
+                        returnStdout: true
+                    ).trim()
+                    env.PAID_PREVIOUS_IMAGE_URI = sh(
+                        script: '''
+                            set -eu
+                            aws ecs describe-task-definition \
+                              --region "${AWS_REGION}" \
+                              --task-definition "${PAID_PREVIOUS_TASK_DEFINITION_ARN}" \
+                              --query "taskDefinition.containerDefinitions[?name=='${PAID_CONTAINER_NAME}'].image | [0]" \
+                              --output text
+                        ''',
+                        returnStdout: true
+                    ).trim()
+                    env.FREE_PREVIOUS_DESIRED_COUNT = sh(
+                        script: '''
+                            set -eu
+                            aws ecs describe-services \
+                              --region "${AWS_REGION}" \
+                              --cluster "${ECS_CLUSTER_NAME}" \
+                              --services "${FREE_ECS_SERVICE_NAME}" \
+                              --query 'services[0].desiredCount' \
+                              --output text
+                        ''',
+                        returnStdout: true
+                    ).trim()
+                    env.PAID_PREVIOUS_DESIRED_COUNT = sh(
+                        script: '''
+                            set -eu
+                            aws ecs describe-services \
+                              --region "${AWS_REGION}" \
+                              --cluster "${ECS_CLUSTER_NAME}" \
+                              --services "${PAID_ECS_SERVICE_NAME}" \
+                              --query 'services[0].desiredCount' \
+                              --output text
+                        ''',
+                        returnStdout: true
+                    ).trim()
+                    if (!env.FREE_PREVIOUS_IMAGE_URI || env.FREE_PREVIOUS_IMAGE_URI == 'None' ||
+                        !env.PAID_PREVIOUS_IMAGE_URI || env.PAID_PREVIOUS_IMAGE_URI == 'None') {
+                        error('Unable to capture the Worker rollback baseline image URI.')
+                    }
+                    if (!env.FREE_PREVIOUS_DESIRED_COUNT || env.FREE_PREVIOUS_DESIRED_COUNT == 'None' ||
+                        !env.PAID_PREVIOUS_DESIRED_COUNT || env.PAID_PREVIOUS_DESIRED_COUNT == 'None') {
+                        error('Unable to capture the Worker rollback baseline desired count.')
+                    }
+                    echo "Captured Free Worker rollback baseline: ${env.FREE_PREVIOUS_TASK_DEFINITION_ARN}"
+                    echo "Captured Paid Worker rollback baseline: ${env.PAID_PREVIOUS_TASK_DEFINITION_ARN}"
+                    echo "Free previous image: ${env.FREE_PREVIOUS_IMAGE_URI}"
+                    echo "Paid previous image: ${env.PAID_PREVIOUS_IMAGE_URI}"
+                    echo "Free previous desired count: ${env.FREE_PREVIOUS_DESIRED_COUNT}"
+                    echo "Paid previous desired count: ${env.PAID_PREVIOUS_DESIRED_COUNT}"
+                    env.PREVIOUS_IMAGES_MATCH = env.FREE_PREVIOUS_IMAGE_URI == env.PAID_PREVIOUS_IMAGE_URI ? 'true' : 'false'
+                    echo "Free/Paid previous images match: ${env.PREVIOUS_IMAGES_MATCH}"
+                    if (env.PREVIOUS_IMAGES_MATCH != 'true') {
+                        echo 'Warning: Free/Paid rollback baselines use different images. Each service will still be restored to its own captured baseline.'
+                    }
+                }
+            }
+        }
+
         // 공통 이미지를 Free Worker에 먼저 등록하고 배포합니다.
         stage('Free Worker Deploy') {
             steps {
@@ -252,28 +366,35 @@ PY
                     echo "Registered Free Worker task definition: ${env.FREE_TASK_DEFINITION_ARN}"
                 }
                 // 안정화 대기 전에 Free Worker Service Update를 한 번만 실행합니다.
-                sh '''
-                    set -eu
-                    CIRCUIT_BREAKER="$(aws ecs describe-services \
-                      --region "${AWS_REGION}" \
-                      --cluster "${ECS_CLUSTER_NAME}" \
-                      --services "${FREE_ECS_SERVICE_NAME}" \
-                      --query 'services[0].deploymentConfiguration.deploymentCircuitBreaker.[enable,rollback]' \
-                      --output text)"
+                script {
+                    env.DEPLOY_PHASE = 'FREE_SERVICE_UPDATE'
+                    sh '''
+                        set -eu
+                        CIRCUIT_BREAKER="$(aws ecs describe-services \
+                          --region "${AWS_REGION}" \
+                          --cluster "${ECS_CLUSTER_NAME}" \
+                          --services "${FREE_ECS_SERVICE_NAME}" \
+                          --query 'services[0].deploymentConfiguration.deploymentCircuitBreaker.[enable,rollback]' \
+                          --output text)"
 
-                    if ! printf '%s\n' "${CIRCUIT_BREAKER}" | awk '$1 == "True" && $2 == "True" { enabled = 1 } END { exit !enabled }'; then
-                      echo "Free Worker deployment circuit breaker with rollback must be enabled before deployment: ${CIRCUIT_BREAKER}"
-                      exit 1
-                    fi
+                        if ! printf '%s\n' "${CIRCUIT_BREAKER}" | awk '$1 == "True" && $2 == "True" { enabled = 1 } END { exit !enabled }'; then
+                          echo "Free Worker deployment circuit breaker with rollback must be enabled before deployment: ${CIRCUIT_BREAKER}"
+                          exit 1
+                        fi
+                    '''
 
-                    aws ecs update-service \
-                      --region "${AWS_REGION}" \
-                      --cluster "${ECS_CLUSTER_NAME}" \
-                      --service "${FREE_ECS_SERVICE_NAME}" \
-                      --task-definition "${FREE_TASK_DEFINITION_ARN}" \
-                      --no-cli-pager >/dev/null
-                    echo "Free Worker service update requested using ${IMAGE_URI}"
-                '''
+                    env.FREE_UPDATE_REQUESTED = 'true'
+                    sh '''
+                        set -eu
+                        aws ecs update-service \
+                          --region "${AWS_REGION}" \
+                          --cluster "${ECS_CLUSTER_NAME}" \
+                          --service "${FREE_ECS_SERVICE_NAME}" \
+                          --task-definition "${FREE_TASK_DEFINITION_ARN}" \
+                          --no-cli-pager >/dev/null
+                        echo "Free Worker service update requested using ${IMAGE_URI}"
+                    '''
+                }
             }
         }
 
@@ -284,6 +405,9 @@ PY
                 timeout(time: 15, unit: 'MINUTES')
             }
             steps {
+                script {
+                    env.DEPLOY_PHASE = 'FREE_SERVICE_STABILIZATION_FAILED'
+                }
                 sh '''
                     set -eu
                     WAIT_EXIT=0
@@ -341,6 +465,9 @@ PY
                 timeout(time: 5, unit: 'MINUTES')
             }
             steps {
+                script {
+                    env.DEPLOY_PHASE = 'FREE_POST_DEPLOY_VERIFICATION_FAILED'
+                }
                 sh '''
                     set -eu
 
@@ -355,6 +482,11 @@ PY
                       echo "Free Worker service revision changed before post-deploy verification completed."
                       echo "Requested task definition: ${FREE_TASK_DEFINITION_ARN}"
                       echo "Final service task definition: ${FINAL_FREE_TASK_DEFINITION_ARN}"
+                      exit 1
+                    fi
+
+                    if [ "${ROLLBACK_TEST_MODE}" = "FREE_VERIFY_FAIL" ]; then
+                      echo "Intentional Free Worker verification failure for rollback test."
                       exit 1
                     fi
 
@@ -426,6 +558,7 @@ PY
         stage('Paid Worker Deploy') {
             steps {
                 script {
+                    env.DEPLOY_PHASE = 'PAID_DEPLOY_PRE_UPDATE_FAILED'
                     // Free Worker 배포 후 검증이 통과한 경우에만 Paid Worker Revision을 등록합니다.
                     env.PAID_TASK_DEFINITION_ARN = sh(
                         script: '''
@@ -483,39 +616,48 @@ PY
                     echo "Registered Paid Worker task definition: ${env.PAID_TASK_DEFINITION_ARN}"
                 }
                 // Free와 Paid Worker Service 모두 동일한 IMAGE_URI를 사용합니다.
-                sh '''
-                    set -eu
-                    CIRCUIT_BREAKER="$(aws ecs describe-services \
-                      --region "${AWS_REGION}" \
-                      --cluster "${ECS_CLUSTER_NAME}" \
-                      --services "${PAID_ECS_SERVICE_NAME}" \
-                      --query 'services[0].deploymentConfiguration.deploymentCircuitBreaker.[enable,rollback]' \
-                      --output text)"
+                script {
+                    env.DEPLOY_PHASE = 'PAID_SERVICE_UPDATE'
+                    sh '''
+                        set -eu
+                        CIRCUIT_BREAKER="$(aws ecs describe-services \
+                          --region "${AWS_REGION}" \
+                          --cluster "${ECS_CLUSTER_NAME}" \
+                          --services "${PAID_ECS_SERVICE_NAME}" \
+                          --query 'services[0].deploymentConfiguration.deploymentCircuitBreaker.[enable,rollback]' \
+                          --output text)"
 
-                    if ! printf '%s\n' "${CIRCUIT_BREAKER}" | awk '$1 == "True" && $2 == "True" { enabled = 1 } END { exit !enabled }'; then
-                      echo "Paid Worker deployment circuit breaker with rollback must be enabled before deployment: ${CIRCUIT_BREAKER}"
-                      exit 1
-                    fi
+                        if ! printf '%s\n' "${CIRCUIT_BREAKER}" | awk '$1 == "True" && $2 == "True" { enabled = 1 } END { exit !enabled }'; then
+                          echo "Paid Worker deployment circuit breaker with rollback must be enabled before deployment: ${CIRCUIT_BREAKER}"
+                          exit 1
+                        fi
+                    '''
 
-                    aws ecs update-service \
-                      --region "${AWS_REGION}" \
-                      --cluster "${ECS_CLUSTER_NAME}" \
-                      --service "${PAID_ECS_SERVICE_NAME}" \
-                      --task-definition "${PAID_TASK_DEFINITION_ARN}" \
-                      --no-cli-pager >/dev/null
-                    echo "Paid Worker service update requested using ${IMAGE_URI}"
-                '''
+                    env.PAID_UPDATE_REQUESTED = 'true'
+                    sh '''
+                        set -eu
+                        aws ecs update-service \
+                          --region "${AWS_REGION}" \
+                          --cluster "${ECS_CLUSTER_NAME}" \
+                          --service "${PAID_ECS_SERVICE_NAME}" \
+                          --task-definition "${PAID_TASK_DEFINITION_ARN}" \
+                          --no-cli-pager >/dev/null
+                        echo "Paid Worker service update requested using ${IMAGE_URI}"
+                    '''
+                }
             }
         }
 
         // Free Worker 성공 후 Paid Worker가 안정화되지 않으면 Pipeline을 실패 처리합니다.
-        // TODO: Free와 Paid가 항상 동일 Revision이어야 한다면 Rollback 정책을 추가합니다.
         stage('Paid Worker Stable Wait') {
             options {
                 // Free Worker 성공 후 Paid Worker 배포도 제한 시간 안에 안정화되어야 합니다.
                 timeout(time: 15, unit: 'MINUTES')
             }
             steps {
+                script {
+                    env.DEPLOY_PHASE = 'PAID_SERVICE_STABILIZATION_FAILED'
+                }
                 sh '''
                     set -eu
                     WAIT_EXIT=0
@@ -579,6 +721,9 @@ PY
                 timeout(time: 5, unit: 'MINUTES')
             }
             steps {
+                script {
+                    env.DEPLOY_PHASE = 'PAID_POST_DEPLOY_VERIFICATION_FAILED'
+                }
                 sh '''
                     set -eu
 
@@ -593,6 +738,11 @@ PY
                       echo "Paid Worker service revision changed before post-deploy verification completed."
                       echo "Requested task definition: ${PAID_TASK_DEFINITION_ARN}"
                       echo "Final service task definition: ${FINAL_PAID_TASK_DEFINITION_ARN}"
+                      exit 1
+                    fi
+
+                    if [ "${ROLLBACK_TEST_MODE}" = "PAID_VERIFY_FAIL" ]; then
+                      echo "Intentional Paid Worker verification failure for rollback test."
                       exit 1
                     fi
 
@@ -657,6 +807,9 @@ PY
 
                     echo "Paid Worker post-deploy verification passed for ${PAID_TASK_DEFINITION_ARN}"
                 '''
+                script {
+                    env.DEPLOY_PHASE = 'DEPLOY_SUCCESS'
+                }
             }
         }
 
@@ -672,6 +825,13 @@ PY
                 echo "Free Worker task definition: ${env.FREE_TASK_DEFINITION_ARN}"
                 echo "Paid Worker service: ${env.PAID_ECS_SERVICE_NAME}"
                 echo "Paid Worker task definition: ${env.PAID_TASK_DEFINITION_ARN}"
+                echo "Rollback baseline Free revision: ${env.FREE_PREVIOUS_TASK_DEFINITION_ARN}"
+                echo "Rollback baseline Free image: ${env.FREE_PREVIOUS_IMAGE_URI}"
+                echo "Rollback baseline Free desired count: ${env.FREE_PREVIOUS_DESIRED_COUNT}"
+                echo "Rollback baseline Paid revision: ${env.PAID_PREVIOUS_TASK_DEFINITION_ARN}"
+                echo "Rollback baseline Paid image: ${env.PAID_PREVIOUS_IMAGE_URI}"
+                echo "Rollback baseline Paid desired count: ${env.PAID_PREVIOUS_DESIRED_COUNT}"
+                echo "Rollback baseline images match: ${env.PREVIOUS_IMAGES_MATCH}"
             }
         }
     }
@@ -679,9 +839,295 @@ PY
     post {
         success {
             echo "Worker image build completed: ${env.IMAGE_URI}"
+            echo "Deployment result: DEPLOY_SUCCESS"
         }
-        failure {
-            echo "Worker pipeline failed. Build: ${env.BUILD_URL}, commit: ${env.GIT_COMMIT_SHA}, image: ${env.IMAGE_URI}"
+        unsuccessful {
+            echo "Worker pipeline did not complete successfully. Build: ${env.BUILD_URL}, commit: ${env.GIT_COMMIT_SHA}, image: ${env.IMAGE_URI}"
+            script {
+                if (env.DEPLOY_PHASE == 'DEPLOY_SUCCESS') {
+                    echo "Rollback skipped: Worker deployment verification already succeeded."
+                } else if (env.FREE_UPDATE_REQUESTED != 'true' && env.PAID_UPDATE_REQUESTED != 'true') {
+                    echo "Rollback skipped: Worker services were not updated by this build."
+                } else {
+                    int rollbackStatus = sh(
+                        returnStatus: true,
+                        script: '''
+                            set -u
+
+                            print_worker_diagnostics() {
+                              SERVICE_NAME="$1"
+                              aws ecs describe-services \
+                                --region "${AWS_REGION}" \
+                                --cluster "${ECS_CLUSTER_NAME}" \
+                                --services "${SERVICE_NAME}" \
+                                --query 'services[0].deployments[].{Status:status,RolloutState:rolloutState,Reason:rolloutStateReason,TaskDefinition:taskDefinition,Desired:desiredCount,Running:runningCount,Failed:failedTasks}' \
+                                --output table || true
+                              aws ecs describe-services \
+                                --region "${AWS_REGION}" \
+                                --cluster "${ECS_CLUSTER_NAME}" \
+                                --services "${SERVICE_NAME}" \
+                                --query 'services[0].events[0:10].[createdAt,message]' \
+                                --output table || true
+                              STOPPED_TASK_ARNS="$(aws ecs list-tasks \
+                                --region "${AWS_REGION}" \
+                                --cluster "${ECS_CLUSTER_NAME}" \
+                                --service-name "${SERVICE_NAME}" \
+                                --desired-status STOPPED \
+                                --max-results 5 \
+                                --query 'taskArns' \
+                                --output text 2>/dev/null || true)"
+                              if [ -n "${STOPPED_TASK_ARNS}" ] && [ "${STOPPED_TASK_ARNS}" != "None" ]; then
+                                aws ecs describe-tasks \
+                                  --region "${AWS_REGION}" \
+                                  --cluster "${ECS_CLUSTER_NAME}" \
+                                  --tasks ${STOPPED_TASK_ARNS} \
+                                  --query 'tasks[].[taskArn,taskDefinitionArn,stopCode,stoppedReason]' \
+                                  --output table || true
+                              fi
+                            }
+
+                            verify_worker_service() {
+                              SERVICE_NAME="$1"
+                              EXPECTED_REVISION="$2"
+                              DESIRED_COUNT="$(aws ecs describe-services \
+                                --region "${AWS_REGION}" \
+                                --cluster "${ECS_CLUSTER_NAME}" \
+                                --services "${SERVICE_NAME}" \
+                                --query 'services[0].desiredCount' \
+                                --output text)" || return 1
+                              RUNNING_COUNT="$(aws ecs describe-services \
+                                --region "${AWS_REGION}" \
+                                --cluster "${ECS_CLUSTER_NAME}" \
+                                --services "${SERVICE_NAME}" \
+                                --query 'services[0].runningCount' \
+                                --output text)" || return 1
+                              case "${DESIRED_COUNT}:${RUNNING_COUNT}" in
+                                *[!0-9:]*)
+                                  echo "Rollback verification failed: Invalid Desired/Running Count values for ${SERVICE_NAME}: desired=${DESIRED_COUNT}, running=${RUNNING_COUNT}"
+                                  return 1
+                                  ;;
+                              esac
+                              if [ "${DESIRED_COUNT}" -eq 0 ]; then
+                                echo "Rollback verification incomplete: Desired Count is 0 for ${SERVICE_NAME}."
+                                echo "Worker execution-state verification requires at least one RUNNING task."
+                                return 3
+                              fi
+                              if [ "${RUNNING_COUNT}" -ne "${DESIRED_COUNT}" ]; then
+                                echo "Rollback verification failed: Running Count (${RUNNING_COUNT}) does not match Desired Count (${DESIRED_COUNT}) for ${SERVICE_NAME}."
+                                return 1
+                              fi
+
+                              TASK_ARNS="$(aws ecs list-tasks \
+                                --region "${AWS_REGION}" \
+                                --cluster "${ECS_CLUSTER_NAME}" \
+                                --service-name "${SERVICE_NAME}" \
+                                --desired-status RUNNING \
+                                --query 'taskArns' \
+                                --output text)" || return 1
+                              if [ -z "${TASK_ARNS}" ] || [ "${TASK_ARNS}" = "None" ]; then
+                                echo "Rollback verification failed: No RUNNING tasks found for ${SERVICE_NAME}."
+                                return 1
+                              fi
+                              UNEXPECTED_TASKS="$(aws ecs describe-tasks \
+                                --region "${AWS_REGION}" \
+                                --cluster "${ECS_CLUSTER_NAME}" \
+                                --tasks ${TASK_ARNS} \
+                                --query "tasks[?taskDefinitionArn!='${EXPECTED_REVISION}'].taskArn" \
+                                --output text)" || return 1
+                              if [ -n "${UNEXPECTED_TASKS}" ] && [ "${UNEXPECTED_TASKS}" != "None" ]; then
+                                echo "Rollback verification failed: RUNNING tasks use an unexpected revision: ${UNEXPECTED_TASKS}"
+                                return 1
+                              fi
+                              sleep 30
+                              NON_RUNNING_TASKS="$(aws ecs describe-tasks \
+                                --region "${AWS_REGION}" \
+                                --cluster "${ECS_CLUSTER_NAME}" \
+                                --tasks ${TASK_ARNS} \
+                                --query "tasks[?lastStatus!='RUNNING'].taskArn" \
+                                --output text)" || return 1
+                              if [ -n "${NON_RUNNING_TASKS}" ] && [ "${NON_RUNNING_TASKS}" != "None" ]; then
+                                echo "Rollback verification failed: Tasks did not remain RUNNING: ${NON_RUNNING_TASKS}"
+                                return 1
+                              fi
+                              return 0
+                            }
+
+                            rollback_worker_service() {
+                              LABEL="$1"
+                              SERVICE_NAME="$2"
+                              REQUESTED_REVISION="$3"
+                              PREVIOUS_REVISION="$4"
+                              CURRENT_REVISION="$(aws ecs describe-services \
+                                --region "${AWS_REGION}" \
+                                --cluster "${ECS_CLUSTER_NAME}" \
+                                --services "${SERVICE_NAME}" \
+                                --query 'services[0].taskDefinition' \
+                                --output text)" || return 1
+
+                              echo "${LABEL} previous revision: ${PREVIOUS_REVISION}"
+                              echo "${LABEL} requested revision: ${REQUESTED_REVISION}"
+                              echo "${LABEL} current revision before rollback: ${CURRENT_REVISION}"
+
+                              if [ "${CURRENT_REVISION}" = "${PREVIOUS_REVISION}" ]; then
+                                echo "${LABEL} rollback action: PREVIOUS_REVISION_ALREADY_ACTIVE"
+                              elif [ "${CURRENT_REVISION}" = "${REQUESTED_REVISION}" ]; then
+                                echo "${LABEL} rollback action: JENKINS_EXPLICIT_ROLLBACK"
+                                EXPLICIT_ROLLBACK_PERFORMED="true"
+                                aws ecs update-service \
+                                  --region "${AWS_REGION}" \
+                                  --cluster "${ECS_CLUSTER_NAME}" \
+                                  --service "${SERVICE_NAME}" \
+                                  --task-definition "${PREVIOUS_REVISION}" \
+                                  --no-cli-pager >/dev/null || return 1
+                              else
+                                echo "${LABEL} rollback result: EXTERNAL_UPDATE_DETECTED"
+                                echo "Automatic rollback stopped to avoid overwriting another deployment."
+                                print_worker_diagnostics "${SERVICE_NAME}"
+                                return 2
+                              fi
+
+                              aws ecs wait services-stable \
+                                --region "${AWS_REGION}" \
+                                --cluster "${ECS_CLUSTER_NAME}" \
+                                --services "${SERVICE_NAME}" || return 1
+                              FINAL_REVISION="$(aws ecs describe-services \
+                                --region "${AWS_REGION}" \
+                                --cluster "${ECS_CLUSTER_NAME}" \
+                                --services "${SERVICE_NAME}" \
+                                --query 'services[0].taskDefinition' \
+                                --output text)" || return 1
+                              if [ "${FINAL_REVISION}" != "${PREVIOUS_REVISION}" ]; then
+                                echo "${LABEL} rollback result: ROLLBACK_FAILED (unexpected final revision: ${FINAL_REVISION})"
+                                return 1
+                              fi
+                              verify_worker_service "${SERVICE_NAME}" "${PREVIOUS_REVISION}"
+                              VERIFY_STATUS=$?
+                              if [ "${VERIFY_STATUS}" -eq 3 ]; then
+                                echo "${LABEL} rollback result: ROLLBACK_VERIFICATION_INCOMPLETE"
+                                return 3
+                              fi
+                              if [ "${VERIFY_STATUS}" -ne 0 ]; then
+                                echo "${LABEL} rollback result: ROLLBACK_FAILED"
+                                return 1
+                              fi
+                              echo "${LABEL} rollback result: PREVIOUS_REVISION_RECOVERY_VERIFIED"
+                              return 0
+                            }
+
+                            assert_service_unchanged() {
+                              LABEL="$1"
+                              SERVICE_NAME="$2"
+                              EXPECTED_REVISION="$3"
+                              CURRENT_REVISION="$(aws ecs describe-services \
+                                --region "${AWS_REGION}" \
+                                --cluster "${ECS_CLUSTER_NAME}" \
+                                --services "${SERVICE_NAME}" \
+                                --query 'services[0].taskDefinition' \
+                                --output text)" || return 1
+                              if [ "${CURRENT_REVISION}" != "${EXPECTED_REVISION}" ]; then
+                                echo "${LABEL} result: EXTERNAL_UPDATE_DETECTED (${CURRENT_REVISION})"
+                                return 2
+                              fi
+                              echo "${LABEL} remained unchanged: ${CURRENT_REVISION}"
+                            }
+
+                            echo "Rollback trigger: ${DEPLOY_PHASE}"
+                            ROLLBACK_VERIFICATION_INCOMPLETE="false"
+                            EXPLICIT_ROLLBACK_PERFORMED="false"
+
+                            if [ "${PAID_UPDATE_REQUESTED}" = "true" ]; then
+                              rollback_worker_service \
+                                "Paid Worker" \
+                                "${PAID_ECS_SERVICE_NAME}" \
+                                "${PAID_TASK_DEFINITION_ARN}" \
+                                "${PAID_PREVIOUS_TASK_DEFINITION_ARN}"
+                              STATUS=$?
+                              if [ "${STATUS}" -eq 3 ]; then
+                                ROLLBACK_VERIFICATION_INCOMPLETE="true"
+                              elif [ "${STATUS}" -ne 0 ]; then
+                                if [ "${STATUS}" -eq 2 ]; then
+                                  echo "Paid Worker rollback result: EXTERNAL_UPDATE_DETECTED"
+                                else
+                                  echo "Paid Worker rollback result: ROLLBACK_FAILED"
+                                fi
+                                print_worker_diagnostics "${PAID_ECS_SERVICE_NAME}"
+                                exit "${STATUS}"
+                              fi
+
+                              rollback_worker_service \
+                                "Free Worker compensating rollback" \
+                                "${FREE_ECS_SERVICE_NAME}" \
+                                "${FREE_TASK_DEFINITION_ARN}" \
+                                "${FREE_PREVIOUS_TASK_DEFINITION_ARN}"
+                              STATUS=$?
+                              if [ "${STATUS}" -eq 3 ]; then
+                                ROLLBACK_VERIFICATION_INCOMPLETE="true"
+                              elif [ "${STATUS}" -ne 0 ]; then
+                                if [ "${STATUS}" -eq 2 ]; then
+                                  echo "Free Worker compensating rollback result: EXTERNAL_UPDATE_DETECTED"
+                                else
+                                  echo "Free Worker compensating rollback result: ROLLBACK_FAILED"
+                                fi
+                                print_worker_diagnostics "${FREE_ECS_SERVICE_NAME}"
+                                exit "${STATUS}"
+                              fi
+
+                              if [ "${ROLLBACK_VERIFICATION_INCOMPLETE}" = "true" ]; then
+                                echo "Rollback result: ROLLBACK_VERIFICATION_INCOMPLETE"
+                                echo "Previous revisions were restored, but Worker RUNNING-state verification could not be completed because Desired Count is 0."
+                                exit 3
+                              fi
+                              if [ "${EXPLICIT_ROLLBACK_PERFORMED}" = "true" ]; then
+                                echo "Rollback result: JENKINS_ROLLBACK_SUCCESS"
+                              else
+                                echo "Rollback result: PREVIOUS_REVISION_RECOVERY_VERIFIED"
+                              fi
+                            elif [ "${FREE_UPDATE_REQUESTED}" = "true" ]; then
+                              rollback_worker_service \
+                                "Free Worker" \
+                                "${FREE_ECS_SERVICE_NAME}" \
+                                "${FREE_TASK_DEFINITION_ARN}" \
+                                "${FREE_PREVIOUS_TASK_DEFINITION_ARN}"
+                              STATUS=$?
+                              if [ "${STATUS}" -eq 3 ]; then
+                                ROLLBACK_VERIFICATION_INCOMPLETE="true"
+                              elif [ "${STATUS}" -ne 0 ]; then
+                                if [ "${STATUS}" -eq 2 ]; then
+                                  echo "Free Worker rollback result: EXTERNAL_UPDATE_DETECTED"
+                                else
+                                  echo "Free Worker rollback result: ROLLBACK_FAILED"
+                                fi
+                                print_worker_diagnostics "${FREE_ECS_SERVICE_NAME}"
+                                exit "${STATUS}"
+                              fi
+
+                              assert_service_unchanged \
+                                "Paid Worker" \
+                                "${PAID_ECS_SERVICE_NAME}" \
+                                "${PAID_PREVIOUS_TASK_DEFINITION_ARN}" || exit $?
+
+                              if [ "${ROLLBACK_VERIFICATION_INCOMPLETE}" = "true" ]; then
+                                echo "Rollback result: ROLLBACK_VERIFICATION_INCOMPLETE"
+                                echo "Free Worker previous revision was restored, but RUNNING-state verification could not be completed because Desired Count is 0."
+                                exit 3
+                              fi
+                              if [ "${EXPLICIT_ROLLBACK_PERFORMED}" = "true" ]; then
+                                echo "Rollback result: JENKINS_ROLLBACK_SUCCESS; Paid deployment was not started."
+                              else
+                                echo "Rollback result: PREVIOUS_REVISION_RECOVERY_VERIFIED; Paid deployment was not started."
+                              fi
+                            fi
+                        '''
+                    )
+                    if (rollbackStatus == 3) {
+                        echo 'Worker rollback result: ROLLBACK_VERIFICATION_INCOMPLETE'
+                    } else if (rollbackStatus == 2) {
+                        echo 'Worker rollback result: EXTERNAL_UPDATE_DETECTED'
+                    } else if (rollbackStatus != 0) {
+                        echo "Worker rollback handling did not complete successfully. Exit code: ${rollbackStatus}"
+                    }
+                }
+            }
         }
         always {
             // 현재 빌드가 생성한 파일과 이미지만 선택적으로 정리합니다.
