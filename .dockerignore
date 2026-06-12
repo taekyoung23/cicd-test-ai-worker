@@ -3,6 +3,12 @@ __pycache__
 *.pyc
 .venv
 .env
+.idea
+.pytest_cache
+logs
+tests
+requirements-test.txt
+*.log
 
 checkpoints
 models

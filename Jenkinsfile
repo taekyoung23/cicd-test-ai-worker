@@ -80,6 +80,8 @@ pipeline {
         disableConcurrentBuilds()
         // Jenkins 저장공간이 계속 증가하지 않도록 최근 빌드 이력 20개만 보관합니다.
         buildDiscarder(logRotator(numToKeepStr: '20'))
+        // Workspace Checkout은 Source Checkout Stage에서 Shallow Clone으로 한 번만 수행합니다.
+        skipDefaultCheckout(true)
         // Free와 Paid Worker를 순차 배포하므로 전체 Pipeline 제한 시간을 길게 설정합니다.
         timeout(time: 45, unit: 'MINUTES')
     }
@@ -115,8 +117,25 @@ pipeline {
         // Webhook을 발생시킨 커밋을 Checkout하고 고정된 fairseq Submodule을 초기화합니다.
         stage('Source Checkout') {
             steps {
-                checkout scm
-                sh 'git submodule update --init --recursive'
+                checkout([
+                    $class: 'GitSCM',
+                    branches: scm.branches,
+                    userRemoteConfigs: scm.userRemoteConfigs,
+                    extensions: [[
+                        $class: 'CloneOption',
+                        shallow: true,
+                        depth: 1,
+                        noTags: true,
+                        timeout: 10
+                    ]]
+                ])
+                sh '''
+                    set -eu
+                    if ! git submodule update --init --recursive --depth 1; then
+                      echo "Shallow submodule checkout failed; retrying with the full pinned submodule history."
+                      git submodule update --init --recursive
+                    fi
+                '''
                 script {
                     env.FREE_UPDATE_REQUESTED = 'false'
                     env.PAID_UPDATE_REQUESTED = 'false'

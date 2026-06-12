@@ -27,6 +27,11 @@ RUN grep -v "^torch==" requirements.txt | grep -v "^torchaudio==" > requirements
     pip install --no-cache-dir -r requirements-no-torch.txt && \
     rm -f requirements-no-torch.txt
 
+COPY fairseq_src /workspace/fairseq_src
+
+RUN cd /workspace/fairseq_src && \
+    pip install --no-cache-dir --editable ./
+
 COPY inference.py /workspace/inference.py
 COPY worker.py /workspace/worker.py
 COPY config.py /workspace/config.py
@@ -37,12 +42,8 @@ COPY sqs_client.py /workspace/sqs_client.py
 COPY db_client.py /workspace/db_client.py
 COPY healthcheck.py /workspace/healthcheck.py
 COPY model_scripts /workspace/model_scripts
-COPY fairseq_src /workspace/fairseq_src
 COPY data_utils_SSL.py /workspace/data_utils_SSL.py
 COPY RawBoost.py /workspace/RawBoost.py
-
-RUN cd /workspace/fairseq_src && \
-    pip install --no-cache-dir --editable ./
 
 EXPOSE 9100
 
