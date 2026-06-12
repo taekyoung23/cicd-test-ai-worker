@@ -252,3 +252,13 @@ Thanks for following open-source projects:
   keywords={Foundation models;Feature extraction;Computational modeling;Computer architecture;Computational efficiency;Dimensionality reduction;Acoustics;Kernel;Robustness;Deepfakes;Deepfake detection;speech anti-spoofing;Res2Net;Nes2Net;SSL;speech foundation model},
   doi={10.1109/TIFS.2025.3626963}}
 ```
+
+## CI Component Tests
+
+The CI tests cover health and configuration logic with mock/CI settings. They
+do not poll SQS, load a model, or connect to S3 or RDS.
+
+```bash
+python -m pip install -r requirements-test.txt
+python -m pytest
+```

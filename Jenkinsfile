@@ -1,3 +1,76 @@
+def slackDisplay(value) {
+    return value == null || value.toString().trim() == '' ? 'N/A' : value.toString()
+}
+
+def sendSlackNotification(String title, Map details) {
+    String messageFile = ".slack-message-${env.BUILD_NUMBER ?: 'unknown'}.txt"
+    String payloadFile = ".slack-payload-${env.BUILD_NUMBER ?: 'unknown'}.json"
+    try {
+        String body = ([title] + details.collect { key, value ->
+            "*${key}:* ${slackDisplay(value)}"
+        }).join('\n')
+        writeFile(file: messageFile, text: body)
+        withCredentials([
+            string(credentialsId: 'slack-webhook-url', variable: 'SLACK_WEBHOOK_URL')
+        ]) {
+            int slackStatus = sh(
+                returnStatus: true,
+                script: """
+                    set +x
+                    set -e
+                    python3 - '${messageFile}' '${payloadFile}' <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], "r", encoding="utf-8") as message_file:
+    message = message_file.read()
+
+with open(sys.argv[2], "w", encoding="utf-8") as payload_file:
+    json.dump({"text": message}, payload_file)
+PY
+                    curl --fail --silent --show-error --connect-timeout 5 --max-time 10 \
+                      --header 'Content-Type: application/json' \
+                      --data-binary @'${payloadFile}' \
+                      "\${SLACK_WEBHOOK_URL}" >/dev/null
+                """
+            )
+            if (slackStatus == 0) {
+                echo 'Slack notification sent'
+            } else {
+                echo "Slack notification failed but ignored. Exit code: ${slackStatus}"
+            }
+        }
+    } catch (Exception ignored) {
+        echo 'Slack notification failed but ignored'
+    } finally {
+        try {
+            sh(returnStatus: true, script: "rm -f '${messageFile}' '${payloadFile}'")
+        } catch (Exception ignored) {
+            echo 'Slack notification payload cleanup failed but ignored'
+        }
+    }
+}
+
+def readEcsServiceRevisionSafely(String serviceName) {
+    try {
+        return sh(
+            script: """
+                set -eu
+                aws ecs describe-services \
+                  --region '${env.AWS_REGION}' \
+                  --cluster '${env.ECS_CLUSTER_NAME}' \
+                  --services '${serviceName}' \
+                  --query 'services[0].taskDefinition' \
+                  --output text
+            """,
+            returnStdout: true
+        ).trim()
+    } catch (Exception ignored) {
+        echo 'Unable to read final ECS revision for Slack notification; ignored.'
+        return 'UNKNOWN'
+    }
+}
+
 pipeline {
     agent any
 
@@ -87,8 +160,8 @@ pipeline {
                       python3 -m venv .venv
                       . .venv/bin/activate
                       python -m pip install --upgrade pip setuptools wheel
-                      pip install pytest
-                      pytest --ignore=fairseq_src
+                      python -m pip install -r requirements-test.txt
+                      python -m pytest --ignore=fairseq_src
                     else
                       echo "No pytest test files found. Skipping pytest."
                     fi
@@ -840,10 +913,45 @@ PY
         success {
             echo "Worker image build completed: ${env.IMAGE_URI}"
             echo "Deployment result: DEPLOY_SUCCESS"
+            script {
+                sendSlackNotification(':white_check_mark: Worker deployment succeeded', [
+                    Result                       : 'SUCCESS',
+                    Job                          : env.JOB_NAME,
+                    Build                        : env.BUILD_NUMBER,
+                    Commit                       : env.GIT_COMMIT_SHA ?: env.GIT_SHORT_SHA,
+                    'Shared Worker Image URI'    : env.IMAGE_URI,
+                    'Shared Worker Image Digest' : env.IMAGE_DIGEST,
+                    'Free Worker Service'        : env.FREE_ECS_SERVICE_NAME,
+                    'Free Task Definition'       : env.FREE_TASK_DEFINITION_ARN,
+                    'Paid Worker Service'        : env.PAID_ECS_SERVICE_NAME,
+                    'Paid Task Definition'       : env.PAID_TASK_DEFINITION_ARN,
+                    'Jenkins Build URL'          : env.BUILD_URL
+                ])
+            }
         }
         unsuccessful {
             echo "Worker pipeline did not complete successfully. Build: ${env.BUILD_URL}, commit: ${env.GIT_COMMIT_SHA}, image: ${env.IMAGE_URI}"
             script {
+                String failureScenario = env.PAID_UPDATE_REQUESTED == 'true' ?
+                    'PAID_FAILED; PAID_ROLLBACK_AND_FREE_COMPENSATING_ROLLBACK_REQUIRED' :
+                    (env.FREE_UPDATE_REQUESTED == 'true' ?
+                        'FREE_FAILED; FREE_ROLLBACK_REQUIRED; PAID_NOT_DEPLOYED' :
+                        'FAILED_BEFORE_WORKER_SERVICE_UPDATE')
+                sendSlackNotification(':x: Worker deployment failed', [
+                    Result                       : 'FAILED',
+                    Job                          : env.JOB_NAME,
+                    Build                        : env.BUILD_NUMBER,
+                    Commit                       : env.GIT_COMMIT_SHA ?: env.GIT_SHORT_SHA,
+                    'Deploy Phase'               : env.DEPLOY_PHASE,
+                    Scenario                     : failureScenario,
+                    'Shared Worker Image URI'    : env.IMAGE_URI,
+                    'Free Worker Service'        : env.FREE_ECS_SERVICE_NAME,
+                    'Paid Worker Service'        : env.PAID_ECS_SERVICE_NAME,
+                    'Free Update Requested'      : env.FREE_UPDATE_REQUESTED,
+                    'Paid Update Requested'      : env.PAID_UPDATE_REQUESTED,
+                    'Jenkins Build URL'          : env.BUILD_URL
+                ])
+
                 if (env.DEPLOY_PHASE == 'DEPLOY_SUCCESS') {
                     echo "Rollback skipped: Worker deployment verification already succeeded."
                 } else if (env.FREE_UPDATE_REQUESTED != 'true' && env.PAID_UPDATE_REQUESTED != 'true') {
@@ -1126,6 +1234,43 @@ PY
                     } else if (rollbackStatus != 0) {
                         echo "Worker rollback handling did not complete successfully. Exit code: ${rollbackStatus}"
                     }
+                    env.WORKER_ROLLBACK_RESULT = rollbackStatus == 0 ? 'RECOVERY_VERIFIED' :
+                        (rollbackStatus == 3 ? 'ROLLBACK_VERIFICATION_INCOMPLETE' :
+                            (rollbackStatus == 2 ? 'EXTERNAL_UPDATE_DETECTED' : 'ROLLBACK_FAILED'))
+                    env.FREE_FINAL_TASK_DEFINITION_ARN = readEcsServiceRevisionSafely(env.FREE_ECS_SERVICE_NAME)
+                    env.PAID_FINAL_TASK_DEFINITION_ARN = readEcsServiceRevisionSafely(env.PAID_ECS_SERVICE_NAME)
+                    String rollbackScenario = env.PAID_UPDATE_REQUESTED == 'true' ?
+                        'PAID_ROLLBACK_AND_FREE_COMPENSATING_ROLLBACK' :
+                        'FREE_ROLLBACK; PAID_NOT_DEPLOYED'
+                    String freeRollbackResult = env.FREE_FINAL_TASK_DEFINITION_ARN == env.FREE_PREVIOUS_TASK_DEFINITION_ARN ?
+                        'BASELINE_RESTORED' :
+                        (env.FREE_FINAL_TASK_DEFINITION_ARN == env.FREE_TASK_DEFINITION_ARN ?
+                            'REQUESTED_REVISION_STILL_ACTIVE' : 'EXTERNAL_OR_UNEXPECTED_REVISION')
+                    String paidRollbackResult = env.PAID_UPDATE_REQUESTED == 'true' ?
+                        (env.PAID_FINAL_TASK_DEFINITION_ARN == env.PAID_PREVIOUS_TASK_DEFINITION_ARN ?
+                            'BASELINE_RESTORED' :
+                            (env.PAID_FINAL_TASK_DEFINITION_ARN == env.PAID_TASK_DEFINITION_ARN ?
+                                'REQUESTED_REVISION_STILL_ACTIVE' : 'EXTERNAL_OR_UNEXPECTED_REVISION')) :
+                        (env.PAID_FINAL_TASK_DEFINITION_ARN == env.PAID_PREVIOUS_TASK_DEFINITION_ARN ?
+                            'NOT_REQUIRED_PAID_NOT_DEPLOYED' : 'UNEXPECTED_REVISION_CHANGE')
+                    sendSlackNotification(':warning: Worker rollback result', [
+                        Scenario                         : rollbackScenario,
+                        'Rollback Result'                : env.WORKER_ROLLBACK_RESULT,
+                        'Free Rollback Result'           : freeRollbackResult,
+                        'Free Requested Revision'        : env.FREE_TASK_DEFINITION_ARN,
+                        'Free Baseline Revision'         : env.FREE_PREVIOUS_TASK_DEFINITION_ARN,
+                        'Free Final Revision'            : env.FREE_FINAL_TASK_DEFINITION_ARN,
+                        'Free Baseline Restored'         : env.FREE_FINAL_TASK_DEFINITION_ARN == env.FREE_PREVIOUS_TASK_DEFINITION_ARN,
+                        'Free Compensating Rollback'     : env.PAID_UPDATE_REQUESTED == 'true',
+                        'Paid Rollback Result'           : paidRollbackResult,
+                        'Paid Requested Revision'        : env.PAID_TASK_DEFINITION_ARN,
+                        'Paid Baseline Revision'         : env.PAID_PREVIOUS_TASK_DEFINITION_ARN,
+                        'Paid Final Revision'            : env.PAID_FINAL_TASK_DEFINITION_ARN,
+                        'Paid Baseline Restored'         : env.PAID_FINAL_TASK_DEFINITION_ARN == env.PAID_PREVIOUS_TASK_DEFINITION_ARN,
+                        'Paid Deployment Started'        : env.PAID_UPDATE_REQUESTED,
+                        'Deploy Phase'                   : env.DEPLOY_PHASE,
+                        'Jenkins Build URL'              : env.BUILD_URL
+                    ])
                 }
             }
         }
