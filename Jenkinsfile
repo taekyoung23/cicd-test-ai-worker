@@ -96,6 +96,8 @@ pipeline {
 
     environment {
         DOCKER_BUILDKIT = '1'
+        TRIVY_IMAGE = 'aquasec/trivy:0.71.0'
+        TRIVY_REPORT_DIR = 'trivy-reports'
         APP_ENV = 'ci'
         WORKER_MODE = 'mock'
         AWS_REGION = 'ap-northeast-2'
@@ -244,6 +246,91 @@ import worker
 
 print("worker image import smoke test passed")
 PY
+                '''
+            }
+        }
+
+        // PyTorch와 fairseq를 포함한 Worker 이미지를 ECR Push 전에 Scan하고 결과를 경고로 기록합니다.
+        stage('Trivy Image Scan - Warning Mode') {
+            steps {
+                sh '''
+                    set -u
+
+                    REPORT_FILE="trivy-worker-${BUILD_NUMBER}.json"
+                    REPORT_PATH="${TRIVY_REPORT_DIR}/${REPORT_FILE}"
+                    TRIVY_CONTAINER_NAME="trivy-worker-${BUILD_NUMBER}"
+
+                    mkdir -p "${TRIVY_REPORT_DIR}" .trivy-cache
+                    rm -f "${REPORT_PATH}"
+                    docker rm -f "${TRIVY_CONTAINER_NAME}" >/dev/null 2>&1 || true
+
+                    cleanup() {
+                      docker rm -f "${TRIVY_CONTAINER_NAME}" >/dev/null 2>&1 || true
+                    }
+                    trap cleanup EXIT
+
+                    echo "Starting Worker image vulnerability scan in Warning Mode."
+                    echo "Worker image scan may take longer because the image includes PyTorch and fairseq."
+                    echo "Scan target: ${IMAGE_URI}"
+                    echo "Severity: HIGH,CRITICAL"
+                    echo "Trivy image: ${TRIVY_IMAGE}"
+
+                    set +e
+                    timeout --signal=TERM 15m docker run --rm \
+                      --name "${TRIVY_CONTAINER_NAME}" \
+                      -v /var/run/docker.sock:/var/run/docker.sock \
+                      -v "${PWD}/.trivy-cache:/root/.cache/trivy" \
+                      -v "${PWD}/${TRIVY_REPORT_DIR}:/reports" \
+                      "${TRIVY_IMAGE}" \
+                      image \
+                      --scanners vuln \
+                      --severity HIGH,CRITICAL \
+                      --exit-code 0 \
+                      --format json \
+                      --output "/reports/${REPORT_FILE}" \
+                      "${IMAGE_URI}"
+                    TRIVY_STATUS=$?
+
+                    if [ "${TRIVY_STATUS}" -ne 0 ] || [ ! -s "${REPORT_PATH}" ]; then
+                      echo "TRIVY_SCAN_INCOMPLETE"
+                      echo "WARNING: Trivy execution or vulnerability DB download failed. Deployment will continue."
+                      exit 0
+                    fi
+
+                    REPORT_PATH="${REPORT_PATH}" python3 - <<'PY'
+import json
+import os
+
+report_path = os.environ["REPORT_PATH"]
+
+with open(report_path, "r", encoding="utf-8") as report_file:
+    report = json.load(report_file)
+
+counts = {"HIGH": 0, "CRITICAL": 0}
+
+for result in report.get("Results", []):
+    for vulnerability in result.get("Vulnerabilities") or []:
+        severity = vulnerability.get("Severity")
+        if severity in counts:
+            counts[severity] += 1
+
+total = counts["HIGH"] + counts["CRITICAL"]
+
+if total:
+    print("TRIVY_SCAN_COMPLETED_WITH_FINDINGS")
+else:
+    print("TRIVY_SCAN_COMPLETED_NO_FINDINGS")
+
+print(f"HIGH={counts['HIGH']}")
+print(f"CRITICAL={counts['CRITICAL']}")
+print("Warning Mode: vulnerabilities do not block deployment.")
+PY
+                    REPORT_STATUS=$?
+                    if [ "${REPORT_STATUS}" -ne 0 ]; then
+                      echo "TRIVY_SCAN_INCOMPLETE"
+                      echo "WARNING: Trivy report parsing failed. Deployment will continue."
+                    fi
+                    exit 0
                 '''
             }
         }
@@ -1294,10 +1381,16 @@ PY
             }
         }
         always {
+            archiveArtifacts(
+                artifacts: "trivy-reports/trivy-worker-${env.BUILD_NUMBER}.json",
+                allowEmptyArchive: true,
+                fingerprint: true
+            )
             // 현재 빌드가 생성한 파일과 이미지만 선택적으로 정리합니다.
             // 다른 Jenkins Job이 같은 Host를 사용할 수 있으므로 전체 Docker prune은 실행하지 않습니다.
             sh '''
                 set +e
+                rm -f "trivy-reports/trivy-worker-${BUILD_NUMBER}.json"
                 rm -rf \
                   .venv \
                   free-task-definition-current.json \
