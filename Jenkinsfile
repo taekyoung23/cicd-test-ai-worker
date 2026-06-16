@@ -98,6 +98,7 @@ pipeline {
         DOCKER_BUILDKIT = '1'
         TRIVY_IMAGE = 'aquasec/trivy:0.71.0'
         TRIVY_REPORT_DIR = 'trivy-reports'
+        DEPLOYMENT_SUMMARY_DIR = 'deployment-summaries'
         APP_ENV = 'ci'
         WORKER_MODE = 'mock'
         AWS_REGION = 'ap-northeast-2'
@@ -258,10 +259,22 @@ PY
 
                     REPORT_FILE="trivy-worker-${BUILD_NUMBER}.json"
                     REPORT_PATH="${TRIVY_REPORT_DIR}/${REPORT_FILE}"
+                    TRIVY_RESULT_PATH=".trivy-result-worker-${BUILD_NUMBER}.json"
                     TRIVY_CONTAINER_NAME="trivy-worker-${BUILD_NUMBER}"
 
                     mkdir -p "${TRIVY_REPORT_DIR}" .trivy-cache
                     rm -f "${REPORT_PATH}"
+                    python3 - "${TRIVY_RESULT_PATH}" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], "w", encoding="utf-8") as result_file:
+    json.dump({
+        "status": "TRIVY_SCAN_INCOMPLETE",
+        "high_count": "N/A",
+        "critical_count": "N/A",
+    }, result_file)
+PY
                     docker rm -f "${TRIVY_CONTAINER_NAME}" >/dev/null 2>&1 || true
 
                     cleanup() {
@@ -297,11 +310,12 @@ PY
                       exit 0
                     fi
 
-                    REPORT_PATH="${REPORT_PATH}" python3 - <<'PY'
+                    REPORT_PATH="${REPORT_PATH}" TRIVY_RESULT_PATH="${TRIVY_RESULT_PATH}" python3 - <<'PY'
 import json
 import os
 
 report_path = os.environ["REPORT_PATH"]
+result_path = os.environ["TRIVY_RESULT_PATH"]
 
 with open(report_path, "r", encoding="utf-8") as report_file:
     report = json.load(report_file)
@@ -317,10 +331,18 @@ for result in report.get("Results", []):
 total = counts["HIGH"] + counts["CRITICAL"]
 
 if total:
-    print("TRIVY_SCAN_COMPLETED_WITH_FINDINGS")
+    status = "TRIVY_SCAN_COMPLETED_WITH_FINDINGS"
 else:
-    print("TRIVY_SCAN_COMPLETED_NO_FINDINGS")
+    status = "TRIVY_SCAN_COMPLETED_NO_FINDINGS"
 
+with open(result_path, "w", encoding="utf-8") as result_file:
+    json.dump({
+        "status": status,
+        "high_count": counts["HIGH"],
+        "critical_count": counts["CRITICAL"],
+    }, result_file)
+
+print(status)
 print(f"HIGH={counts['HIGH']}")
 print(f"CRITICAL={counts['CRITICAL']}")
 print("Warning Mode: vulnerabilities do not block deployment.")
@@ -1401,6 +1423,132 @@ PY
                   docker image rm "${IMAGE_URI}" >/dev/null 2>&1 || true
                 fi
             '''
+        }
+        cleanup {
+            script {
+                env.SUMMARY_BUILD_RESULT = currentBuild.currentResult ?: 'UNKNOWN'
+                env.SUMMARY_ROLLBACK_HANDLING_EXECUTED =
+                    (env.FREE_UPDATE_REQUESTED == 'true' || env.PAID_UPDATE_REQUESTED == 'true') &&
+                    env.DEPLOY_PHASE != 'DEPLOY_SUCCESS' ? 'true' : 'false'
+                env.SUMMARY_FREE_COMPENSATING_ROLLBACK_REQUIRED =
+                    env.PAID_UPDATE_REQUESTED == 'true' && env.DEPLOY_PHASE != 'DEPLOY_SUCCESS' ? 'true' : 'false'
+                env.SUMMARY_FREE_FINAL_REVISION = env.FREE_FINAL_TASK_DEFINITION_ARN ?:
+                    (env.DEPLOY_PHASE == 'DEPLOY_SUCCESS' ? env.FREE_TASK_DEFINITION_ARN : 'N/A')
+                env.SUMMARY_PAID_FINAL_REVISION = env.PAID_FINAL_TASK_DEFINITION_ARN ?:
+                    (env.DEPLOY_PHASE == 'DEPLOY_SUCCESS' ? env.PAID_TASK_DEFINITION_ARN : 'N/A')
+
+                if (env.DEPLOY_PHASE == 'DEPLOY_SUCCESS') {
+                    env.SUMMARY_FREE_DEPLOY_RESULT = 'DEPLOY_SUCCESS'
+                    env.SUMMARY_PAID_DEPLOY_RESULT = 'DEPLOY_SUCCESS'
+                } else {
+                    env.SUMMARY_FREE_DEPLOY_RESULT = env.FREE_UPDATE_REQUESTED == 'true' ?
+                        (env.SUMMARY_FREE_FINAL_REVISION == env.FREE_PREVIOUS_TASK_DEFINITION_ARN ?
+                            'BASELINE_RESTORED' : 'DEPLOY_FAILED') : 'NOT_STARTED'
+                    env.SUMMARY_PAID_DEPLOY_RESULT = env.PAID_UPDATE_REQUESTED == 'true' ?
+                        (env.SUMMARY_PAID_FINAL_REVISION == env.PAID_PREVIOUS_TASK_DEFINITION_ARN ?
+                            'BASELINE_RESTORED' : 'DEPLOY_FAILED') : 'NOT_STARTED'
+                }
+
+                int summaryStatus = sh(
+                    returnStatus: true,
+                    script: '''
+                        set +e
+                        mkdir -p "${DEPLOYMENT_SUMMARY_DIR}"
+                        python3 - <<'PY'
+import datetime
+import json
+import os
+
+def value(name):
+    result = os.environ.get(name)
+    return result if result else "N/A"
+
+trivy = {
+    "status": "TRIVY_SCAN_INCOMPLETE",
+    "high_count": "N/A",
+    "critical_count": "N/A",
+}
+trivy_path = f".trivy-result-worker-{value('BUILD_NUMBER')}.json"
+try:
+    with open(trivy_path, "r", encoding="utf-8") as trivy_file:
+        trivy.update(json.load(trivy_file))
+except Exception:
+    pass
+
+summary = {
+    "schema_version": "1.0",
+    "service_type": "worker",
+    "job_name": value("JOB_NAME"),
+    "build_number": value("BUILD_NUMBER"),
+    "build_result": value("SUMMARY_BUILD_RESULT"),
+    "git_commit_sha": value("GIT_COMMIT_SHA"),
+    "git_short_sha": value("GIT_SHORT_SHA"),
+    "image_tag": value("IMAGE_TAG"),
+    "image_uri": value("IMAGE_URI"),
+    "image_digest": value("IMAGE_DIGEST"),
+    "ecs_cluster": value("ECS_CLUSTER_NAME"),
+    "deploy_phase": value("DEPLOY_PHASE"),
+    "free_worker": {
+        "service": value("FREE_ECS_SERVICE_NAME"),
+        "task_definition_family": value("FREE_ECS_TASK_FAMILY"),
+        "baseline_revision": value("FREE_PREVIOUS_TASK_DEFINITION_ARN"),
+        "requested_revision": value("FREE_TASK_DEFINITION_ARN"),
+        "final_revision": value("SUMMARY_FREE_FINAL_REVISION"),
+        "update_requested": value("FREE_UPDATE_REQUESTED"),
+        "deploy_result": value("SUMMARY_FREE_DEPLOY_RESULT"),
+    },
+    "paid_worker": {
+        "service": value("PAID_ECS_SERVICE_NAME"),
+        "task_definition_family": value("PAID_ECS_TASK_FAMILY"),
+        "baseline_revision": value("PAID_PREVIOUS_TASK_DEFINITION_ARN"),
+        "requested_revision": value("PAID_TASK_DEFINITION_ARN"),
+        "final_revision": value("SUMMARY_PAID_FINAL_REVISION"),
+        "update_requested": value("PAID_UPDATE_REQUESTED"),
+        "deploy_result": value("SUMMARY_PAID_DEPLOY_RESULT"),
+    },
+    "rollback": {
+        "handling_executed": value("SUMMARY_ROLLBACK_HANDLING_EXECUTED"),
+        "result": value("WORKER_ROLLBACK_RESULT"),
+        "free_compensating_rollback_required": value("SUMMARY_FREE_COMPENSATING_ROLLBACK_REQUIRED"),
+    },
+    "trivy": {
+        "mode": "WARNING",
+        **trivy,
+    },
+    "build_url": value("BUILD_URL"),
+    "timestamp_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+}
+
+summary_path = (
+    f"{value('DEPLOYMENT_SUMMARY_DIR')}/"
+    f"deployment-summary-worker-{value('BUILD_NUMBER')}.json"
+)
+with open(summary_path, "w", encoding="utf-8") as summary_file:
+    json.dump(summary, summary_file, indent=2)
+PY
+                    '''
+                )
+                if (summaryStatus != 0) {
+                    echo "WARNING: Worker deployment summary generation failed. Existing build result is unchanged."
+                } else {
+                    try {
+                        archiveArtifacts(
+                            artifacts: "deployment-summaries/deployment-summary-worker-${env.BUILD_NUMBER}.json",
+                            fingerprint: true
+                        )
+                    } catch (Exception ignored) {
+                        echo "WARNING: Worker deployment summary archive failed. Existing build result is unchanged."
+                    }
+                }
+                sh(
+                    returnStatus: true,
+                    script: '''
+                        rm -f \
+                          "deployment-summaries/deployment-summary-worker-${BUILD_NUMBER}.json" \
+                          ".trivy-result-worker-${BUILD_NUMBER}.json"
+                    '''
+                )
+            }
         }
     }
 }
