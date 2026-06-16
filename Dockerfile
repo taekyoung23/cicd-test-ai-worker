@@ -1,20 +1,15 @@
-FROM python:3.10-bullseye
+FROM python:3.10-bullseye AS builder
 
 WORKDIR /workspace
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV CUDA_VISIBLE_DEVICES=""
 ENV PYTHONUNBUFFERED=1
-ENV WORKER_MODE=aws
-ENV MODEL_DIR=/models
-ENV MODEL_PATH=/models/wav2LM_Nes2Net_X.pth
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     ffmpeg \
     && rm -rf /var/lib/apt/lists/*
-
-RUN mkdir -p /models
 
 RUN pip install --no-cache-dir "pip<24.1" setuptools wheel
 
@@ -31,6 +26,26 @@ COPY fairseq_src /workspace/fairseq_src
 
 RUN cd /workspace/fairseq_src && \
     pip install --no-cache-dir --editable ./
+
+FROM python:3.10-bullseye AS runtime
+
+WORKDIR /workspace
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV CUDA_VISIBLE_DEVICES=""
+ENV PYTHONUNBUFFERED=1
+ENV WORKER_MODE=aws
+ENV MODEL_DIR=/models
+ENV MODEL_PATH=/models/wav2LM_Nes2Net_X.pth
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN mkdir -p /models
+
+COPY --from=builder /usr/local /usr/local
+COPY --from=builder /workspace/fairseq_src /workspace/fairseq_src
 
 COPY inference.py /workspace/inference.py
 COPY worker.py /workspace/worker.py
