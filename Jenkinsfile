@@ -60,13 +60,37 @@ def readTrivySummary(String serviceType) {
     String resultPath = ".trivy-result-${serviceType}-${env.BUILD_NUMBER ?: 'unknown'}.json"
     try {
         if (fileExists(resultPath)) {
-            def parsed = new groovy.json.JsonSlurperClassic().parseText(readFile(resultPath))
-            summary.status = parsed.status ?: summary.status
-            summary.high_count = parsed.high_count != null ? parsed.high_count.toString() : summary.high_count
-            summary.critical_count = parsed.critical_count != null ? parsed.critical_count.toString() : summary.critical_count
+            String parsedText = sh(
+                returnStdout: true,
+                script: """
+                    python3 - '${resultPath}' <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], "r", encoding="utf-8") as result_file:
+    data = json.load(result_file)
+
+print(f"status={data.get('status', 'TRIVY_SCAN_INCOMPLETE')}")
+print(f"high_count={data.get('high_count', 'N/A')}")
+print(f"critical_count={data.get('critical_count', 'N/A')}")
+PY
+                """
+            ).trim()
+            parsedText.split('\\n').each { line ->
+                int separator = line.indexOf('=')
+                if (separator > 0) {
+                    String key = line.substring(0, separator)
+                    String value = line.substring(separator + 1)
+                    if (summary.containsKey(key)) {
+                        summary[key] = value?.trim() ? value.trim() : summary[key]
+                    }
+                }
+            }
+        } else {
+            echo "Trivy summary file not found: ${resultPath}; using incomplete defaults."
         }
-    } catch (Exception ignored) {
-        echo "Unable to read Trivy summary from ${resultPath}; using incomplete defaults."
+    } catch (Exception error) {
+        echo "Unable to read Trivy summary from ${resultPath}; using incomplete defaults. Reason: ${error.getClass().getSimpleName()}: ${error.getMessage()}"
     }
     return summary
 }
@@ -318,7 +342,7 @@ def invokeBedrockFailureSummary(String serviceType, String prompt, Map metadata)
         Map skipped = [
             enabled          : true,
             provider         : 'bedrock',
-            status           : 'SUMMARY_SKIPPED',
+            status           : 'BEDROCK_SKIPPED_EMPTY_MODEL_ID',
             error            : 'BEDROCK_MODEL_ID is not configured',
             failed_stage     : metadata.failed_stage ?: 'N/A',
             rollback_status  : metadata.rollback_status ?: 'N/A',
@@ -332,7 +356,9 @@ def invokeBedrockFailureSummary(String serviceType, String prompt, Map metadata)
     String promptFile = ".ai-failure-prompt-${serviceType}-${env.BUILD_NUMBER ?: 'unknown'}.txt"
     String requestFile = ".ai-failure-request-${serviceType}-${env.BUILD_NUMBER ?: 'unknown'}.json"
     String responseFile = ".ai-failure-response-${serviceType}-${env.BUILD_NUMBER ?: 'unknown'}.json"
-    String summaryFile = ".ai-failure-summary-${serviceType}-${env.BUILD_NUMBER ?: 'unknown'}.json"
+    String errorFile = ".ai-failure-error-${serviceType}-${env.BUILD_NUMBER ?: 'unknown'}.log"
+    String runtimeSummaryFile = ".ai-failure-runtime-summary-${serviceType}-${env.BUILD_NUMBER ?: 'unknown'}.json"
+    String propertiesFile = ".ai-failure-summary-${serviceType}-${env.BUILD_NUMBER ?: 'unknown'}.properties"
     writeFile(file: promptFile, text: maskSensitiveText(truncateText(prompt, 12000)))
 
     int status = sh(
@@ -354,9 +380,13 @@ with open(sys.argv[2], "w", encoding="utf-8") as request_file:
         "anthropic_version": "bedrock-2023-05-31",
         "max_tokens": 700,
         "temperature": 0.2,
-        "messages": [{"role": "user", "content": prompt}]
+        "messages": [{
+            "role": "user",
+            "content": [{"type": "text", "text": prompt}]
+        }]
     }, request_file)
 PY
+            rm -f '${responseFile}' '${errorFile}' '${runtimeSummaryFile}' '${propertiesFile}'
             timeout 30 aws bedrock-runtime invoke-model \
               --region "\${BEDROCK_REGION:-${env.AWS_REGION}}" \
               --model-id '${modelId}' \
@@ -364,17 +394,33 @@ PY
               --accept 'application/json' \
               --cli-binary-format raw-in-base64-out \
               --body "fileb://${requestFile}" \
-              '${responseFile}' >/dev/null 2>&1
+              '${responseFile}' >/dev/null 2>'${errorFile}'
             BEDROCK_STATUS=\$?
-            BEDROCK_MODEL_ID_FOR_SUMMARY='${modelId}' python3 - '${responseFile}' '${summaryFile}' "\${BEDROCK_STATUS}" <<'PY'
+            BEDROCK_MODEL_ID_FOR_SUMMARY='${modelId}' python3 - '${responseFile}' '${runtimeSummaryFile}' '${errorFile}' '${propertiesFile}' "\${BEDROCK_STATUS}" <<'PY'
 import json
 import os
 import sys
 
-response_path, summary_path, status = sys.argv[1], sys.argv[2], sys.argv[3]
+response_path, summary_path, error_path, properties_path, status = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5]
 summary_text = ""
 error = ""
+status_name = "SUMMARY_FAILED"
 section_labels = ["Likely Cause", "Rollback Status", "Next Action"]
+
+def read_error():
+    try:
+        with open(error_path, "r", encoding="utf-8", errors="replace") as error_file:
+            return error_file.read().strip()
+    except Exception:
+        return ""
+
+def classify_error(message):
+    lowered = message.lower()
+    if "accessdenied" in lowered or "not authorized" in lowered or "unauthorized" in lowered:
+        return "BEDROCK_ACCESS_DENIED"
+    if "validationexception" in lowered or "validation" in lowered:
+        return "BEDROCK_VALIDATION_ERROR"
+    return "BEDROCK_INVOKE_FAILED"
 
 def extract_sections(text):
     sections = {label: "" for label in section_labels}
@@ -411,17 +457,26 @@ if status == "0":
             summary_text = response.get("generation", "")
         if not summary_text:
             error = "Bedrock response parsing failed"
+            status_name = "BEDROCK_RESPONSE_PARSE_FAILED"
+        else:
+            status_name = "SUMMARY_CREATED"
     except Exception as exc:
         error = f"Bedrock response parsing failed: {exc}"
+        status_name = "BEDROCK_RESPONSE_PARSE_FAILED"
 else:
+    stderr_text = read_error()
     error = f"Bedrock invoke-model failed with exit code {status}"
+    if stderr_text:
+        error = f"{error}: {stderr_text[:1200]}"
+    status_name = classify_error(stderr_text)
 
 sections = extract_sections(summary_text) if summary_text else {label: "" for label in section_labels}
 payload = {
     "enabled": True,
     "provider": "bedrock",
     "model": os.environ.get("BEDROCK_MODEL_ID_FOR_SUMMARY", "configured-via-jenkins-parameter"),
-    "status": "SUMMARY_CREATED" if summary_text else "SUMMARY_FAILED",
+    "status": status_name,
+    "invoke_exit_code": status,
     "summary_for_slack": summary_text if summary_text else "AI Failure Summary failed. Check Jenkins console and AWS deployment logs manually.",
     "likely_cause": sections.get("Likely Cause", ""),
     "rollback_status_text": sections.get("Rollback Status", ""),
@@ -431,6 +486,11 @@ payload = {
 }
 with open(summary_path, "w", encoding="utf-8") as summary_file:
     json.dump(payload, summary_file, indent=2, ensure_ascii=False)
+with open(properties_path, "w", encoding="utf-8") as properties_file:
+    for key in ["enabled", "provider", "model", "status", "invoke_exit_code", "summary_for_slack", "likely_cause", "rollback_status_text", "next_action", "error", "masked"]:
+        value = payload.get(key, "")
+        value = str(value).replace("\\r", "\\\\r").replace("\\n", "\\\\n")
+        properties_file.write(f"{key}={value}\\n")
 PY
             exit 0
         """
@@ -439,17 +499,39 @@ PY
         enabled          : true,
         provider         : 'bedrock',
         status           : 'SUMMARY_FAILED',
+        invoke_exit_code : 'N/A',
         error            : "AI summary shell wrapper failed with exit code ${status}",
         summary_for_slack: 'AI Failure Summary failed. Check Jenkins console and AWS deployment logs manually.',
+        likely_cause     : fallbackWorkerLikelyCause(metadata.failed_stage ?: 'N/A', metadata.target ?: 'Unknown'),
+        rollback_status_text: fallbackWorkerRollbackStatusText(metadata.rollback_status ?: 'N/A', metadata.target ?: 'Unknown', metadata.compensation_rollback ?: 'N/A'),
+        next_action      : fallbackWorkerNextAction(metadata.rollback_status ?: 'N/A', metadata.target ?: 'Unknown'),
         masked           : true
     ]
     try {
-        if (fileExists(summaryFile)) {
-            parsed = new groovy.json.JsonSlurperClassic().parseText(readFile(summaryFile))
+        if (fileExists(errorFile)) {
+            String bedrockError = maskSensitiveText(truncateText(readFile(errorFile), 1200))
+            if (bedrockError?.trim()) {
+                echo "AI failure summary: Bedrock stderr summary: ${bedrockError.trim()}"
+            }
         }
-    } catch (Exception ignored) {
-        echo 'AI failure summary: unable to parse summary file; using failed fallback.'
+        if (fileExists(propertiesFile)) {
+            Map fromProperties = [:]
+            readFile(propertiesFile).split('\\n').each { line ->
+                int separator = line.indexOf('=')
+                if (separator > 0) {
+                    String key = line.substring(0, separator)
+                    String value = line.substring(separator + 1)
+                    fromProperties[key] = value.replace('\\n', '\n').replace('\\r', '\r')
+                }
+            }
+            parsed = fromProperties
+            parsed.enabled = parsed.enabled == 'true'
+            parsed.masked = parsed.masked == 'true'
+        }
+    } catch (Exception error) {
+        echo "AI failure summary: unable to parse summary properties; using failed fallback. Reason: ${error.getClass().getSimpleName()}: ${error.getMessage()}"
     }
+    echo "AI failure summary: shell wrapper exit code=${status}, Bedrock invoke exit code=${parsed.invoke_exit_code ?: 'N/A'}, summary status=${parsed.status ?: 'N/A'}, error=${maskSensitiveText(truncateText(parsed.error ?: 'N/A', 1200))}"
     parsed.failed_stage = metadata.failed_stage ?: 'N/A'
     parsed.likely_cause = parsed.likely_cause ?: fallbackWorkerLikelyCause(parsed.failed_stage, metadata.target ?: 'Unknown')
     parsed.evidence = metadata.evidence ?: 'N/A'
@@ -461,7 +543,7 @@ PY
     parsed.next_action = parsed.next_action ?: fallbackWorkerNextAction(parsed.rollback_status, metadata.target ?: 'Unknown')
     parsed.masked = true
     writeAiFailureSummaryArtifact(serviceType, parsed)
-    sh(returnStatus: true, script: "rm -f '${promptFile}' '${requestFile}' '${responseFile}' '${summaryFile}'")
+    sh(returnStatus: true, script: "rm -f '${promptFile}' '${requestFile}' '${responseFile}' '${runtimeSummaryFile}' '${propertiesFile}' '${errorFile}'")
     return parsed
 }
 
