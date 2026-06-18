@@ -51,6 +51,38 @@ PY
     }
 }
 
+def readTrivySummary(String serviceType) {
+    Map summary = [
+        status        : 'TRIVY_SCAN_INCOMPLETE',
+        high_count    : 'N/A',
+        critical_count: 'N/A'
+    ]
+    String resultPath = ".trivy-result-${serviceType}-${env.BUILD_NUMBER ?: 'unknown'}.json"
+    try {
+        if (fileExists(resultPath)) {
+            def parsed = new groovy.json.JsonSlurperClassic().parseText(readFile(resultPath))
+            summary.status = parsed.status ?: summary.status
+            summary.high_count = parsed.high_count != null ? parsed.high_count.toString() : summary.high_count
+            summary.critical_count = parsed.critical_count != null ? parsed.critical_count.toString() : summary.critical_count
+        }
+    } catch (Exception ignored) {
+        echo "Unable to read Trivy summary from ${resultPath}; using incomplete defaults."
+    }
+    return summary
+}
+
+def trivySlackDetails(String serviceType) {
+    Map trivy = readTrivySummary(serviceType)
+    return [
+        'Trivy'          : trivy.status,
+        'Trivy HIGH'     : trivy.high_count,
+        'Trivy CRITICAL' : trivy.critical_count,
+        'Trivy Mode'     : 'WARNING',
+        'Trivy Gate'     : 'NOT_APPLIED',
+        'Trivy Report'   : 'Jenkins Artifact 확인'
+    ]
+}
+
 def readEcsServiceRevisionSafely(String serviceName) {
     try {
         return sh(
@@ -68,6 +100,358 @@ def readEcsServiceRevisionSafely(String serviceName) {
     } catch (Exception ignored) {
         echo 'Unable to read final ECS revision for Slack notification; ignored.'
         return 'UNKNOWN'
+    }
+}
+
+def maskSensitiveText(String text) {
+    if (text == null) {
+        return 'N/A'
+    }
+    String masked = text
+    masked = masked.replaceAll(/arn:aws:[A-Za-z0-9_:\\/+=,.@-]+/, '[MASKED_ARN]')
+    masked = masked.replaceAll(/(?<![0-9])[0-9]{12}(?![0-9])/, '[MASKED_ACCOUNT]')
+    masked = masked.replaceAll(/[0-9]{12}\.dkr\.ecr\.[A-Za-z0-9-]+\.amazonaws\.com\/[A-Za-z0-9._\/-]+(:[A-Za-z0-9._-]+)?/, '[MASKED_ECR_URI]')
+    masked = masked.replaceAll(/https?:\/\/hooks\.slack\.com\/[A-Za-z0-9\/+_-]+/, '[MASKED_SLACK_WEBHOOK]')
+    masked = masked.replaceAll(/https?:\/\/[^\\s"']*X-Amz-Signature=[^\\s"']+/, '[MASKED_PRESIGNED_URL]')
+    masked = masked.replaceAll(/(ghp|gho|ghu|ghs|ghr|github_pat)_[A-Za-z0-9_]+/, '[MASKED_GITHUB_TOKEN]')
+    masked = masked.replaceAll(/A[KS]IA[0-9A-Z]{16}/, '[MASKED_AWS_KEY]')
+    masked = masked.replaceAll(/(?i)(password|passwd|pwd|secret|token|authorization|credential)(\\s*[:=]\\s*)[^\\s,'"}]+/, '$1$2[MASKED_SECRET]')
+    masked = masked.replaceAll(/(?i)(db[_-]?(host|user|password)|database[_-]?url)(\\s*[:=]\\s*)[^\\s,'"}]+/, '$1$3[MASKED_DB]')
+    masked = masked.replaceAll(/https:\/\/sqs\.[A-Za-z0-9-]+\.amazonaws\.com\/[0-9]{12}\/[A-Za-z0-9._-]+/, '[MASKED_QUEUE_URL]')
+    masked = masked.replaceAll(/s3:\/\/[^\\s,'"}]+/, '[MASKED_S3_PATH]')
+    masked = masked.replaceAll(/(?<![0-9])(?:10|172\\.(?:1[6-9]|2[0-9]|3[0-1])|192\\.168)\\.[0-9]{1,3}\\.[0-9]{1,3}(?![0-9])/, '[MASKED_IP]')
+    masked = masked.replaceAll(/(?<![0-9])(?:[0-9]{1,3}\\.){3}[0-9]{1,3}(?![0-9])/, '[MASKED_IP]')
+    masked = masked.replaceAll(/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/, '[MASKED_EMAIL]')
+    return masked
+}
+
+def truncateText(String text, int maxLength = 12000) {
+    if (text == null) {
+        return 'N/A'
+    }
+    if (text.length() <= maxLength) {
+        return text
+    }
+    return text.substring(text.length() - maxLength)
+}
+
+def collectConsoleLogTail(int lineCount = 200) {
+    try {
+        return maskSensitiveText(truncateText(currentBuild.rawBuild.getLog(lineCount).join('\n')))
+    } catch (Exception ignored) {
+        echo 'AI failure summary: Jenkins console log tail collection failed but ignored.'
+        return 'LOG_COLLECTION_FAILED'
+    }
+}
+
+def runMaskedCommand(String command, int maxLength = 8000) {
+    try {
+        String output = sh(script: command, returnStdout: true).trim()
+        return maskSensitiveText(truncateText(output, maxLength))
+    } catch (Exception ignored) {
+        return 'LOG_COLLECTION_FAILED'
+    }
+}
+
+def collectWorkerServiceDiagnostics(String serviceName, String logGroupName) {
+    String serviceEvents = runMaskedCommand("""
+        set +e
+        aws ecs describe-services \
+          --region '${env.AWS_REGION}' \
+          --cluster '${env.ECS_CLUSTER_NAME}' \
+          --services '${serviceName}' \
+          --query 'services[0].events[0:8].[createdAt,message]' \
+          --output text
+    """)
+    String stoppedTasks = runMaskedCommand("""
+        set +e
+        STOPPED_TASK_ARNS=\$(aws ecs list-tasks \
+          --region '${env.AWS_REGION}' \
+          --cluster '${env.ECS_CLUSTER_NAME}' \
+          --service-name '${serviceName}' \
+          --desired-status STOPPED \
+          --max-results 5 \
+          --query 'taskArns' \
+          --output text 2>/dev/null)
+        if [ -n "\${STOPPED_TASK_ARNS}" ] && [ "\${STOPPED_TASK_ARNS}" != "None" ]; then
+          aws ecs describe-tasks \
+            --region '${env.AWS_REGION}' \
+            --cluster '${env.ECS_CLUSTER_NAME}' \
+            --tasks \${STOPPED_TASK_ARNS} \
+            --query 'tasks[].[taskArn,taskDefinitionArn,stopCode,stoppedReason]' \
+            --output text
+        else
+          echo 'NO_RECENT_STOPPED_TASKS'
+        fi
+    """)
+    String cloudWatchLogs = runMaskedCommand("""
+        set +e
+        START_TIME=\$(( \$(date +%s%3N) - 600000 ))
+        aws logs filter-log-events \
+          --region '${env.AWS_REGION}' \
+          --log-group-name '${logGroupName}' \
+          --start-time "\${START_TIME}" \
+          --limit 30 \
+          --query 'events[].message' \
+          --output text
+    """)
+    return [
+        service_events  : serviceEvents,
+        stopped_tasks   : stoppedTasks,
+        cloudwatch_logs : cloudWatchLogs
+    ]
+}
+
+def buildAiFailurePrompt(String serviceName, Map context) {
+    String contextJson = groovy.json.JsonOutput.prettyPrint(groovy.json.JsonOutput.toJson(context))
+    return """너는 SecureVoiceGuard CI/CD 장애 분석 보조 에이전트다.
+
+아래 정보는 Jenkins Pipeline 실패 이후 수집된 메타데이터와 마스킹된 로그다.
+제공된 정보 안에서만 판단하고, 확정 원인이 아니라 "추정 원인"으로 표현해라.
+민감정보, 계정 ID, ARN, IP, URL, Secret, Token, DB 정보, Queue URL, S3 경로는 출력하지 마라.
+로그가 부족하면 "로그 부족"이라고 말해라.
+Trivy Warning Mode 결과는 현재 배포 차단 사유가 아니므로 실패 원인으로 단정하지 마라.
+Rollback이 성공했는지, 실패했는지, 또는 불필요했는지 구분해라.
+Worker는 이번 범위에서 SQS/DLQ/RDS/S3/inference 런타임 원인 분석을 하지 말고 배포 실패 정보만 요약해라.
+Slack 메시지용으로 7줄 이내로 작성해라.
+
+출력 형식:
+
+[AI Failure Summary]
+1. 실패 위치:
+2. 추정 원인:
+3. 근거 로그:
+4. 영향 범위:
+5. Rollback 상태:
+6. 다음 조치:
+
+서비스: ${serviceName}
+입력 데이터:
+${contextJson}
+"""
+}
+
+def writeAiFailureSummaryArtifact(String serviceType, Map summary) {
+    String artifactPath = ".ai-failure-summary-${serviceType}-${env.BUILD_NUMBER ?: 'unknown'}.json"
+    try {
+        writeFile(
+            file: artifactPath,
+            text: groovy.json.JsonOutput.prettyPrint(groovy.json.JsonOutput.toJson(summary))
+        )
+    } catch (Exception ignored) {
+        echo "AI failure summary: unable to write ${artifactPath}; ignored."
+    }
+    return artifactPath
+}
+
+def invokeBedrockFailureSummary(String serviceType, String prompt, Map metadata) {
+    String modelId = params.BEDROCK_MODEL_ID ?: env.BEDROCK_MODEL_ID
+    if (modelId == null || modelId.trim() == '') {
+        Map skipped = [
+            enabled          : true,
+            provider         : 'bedrock',
+            status           : 'SUMMARY_SKIPPED',
+            error            : 'BEDROCK_MODEL_ID is not configured',
+            failed_stage     : metadata.failed_stage ?: 'N/A',
+            rollback_status  : metadata.rollback_status ?: 'N/A',
+            summary_for_slack: 'AI Failure Summary skipped: BEDROCK_MODEL_ID is not configured.',
+            masked           : true
+        ]
+        writeAiFailureSummaryArtifact(serviceType, skipped)
+        return skipped
+    }
+
+    String promptFile = ".ai-failure-prompt-${serviceType}-${env.BUILD_NUMBER ?: 'unknown'}.txt"
+    String requestFile = ".ai-failure-request-${serviceType}-${env.BUILD_NUMBER ?: 'unknown'}.json"
+    String responseFile = ".ai-failure-response-${serviceType}-${env.BUILD_NUMBER ?: 'unknown'}.json"
+    String summaryFile = ".ai-failure-summary-${serviceType}-${env.BUILD_NUMBER ?: 'unknown'}.json"
+    writeFile(file: promptFile, text: maskSensitiveText(truncateText(prompt, 12000)))
+
+    int status = sh(
+        returnStatus: true,
+        script: """
+            set +x
+            set +e
+            python3 - '${promptFile}' '${requestFile}' <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], "r", encoding="utf-8") as prompt_file:
+    prompt = prompt_file.read()
+
+# Bedrock model id/region/model access must be verified in the target AWS account.
+# This request body uses the Anthropic Claude Messages API schema.
+with open(sys.argv[2], "w", encoding="utf-8") as request_file:
+    json.dump({
+        "anthropic_version": "bedrock-2023-05-31",
+        "max_tokens": 700,
+        "temperature": 0.2,
+        "messages": [{"role": "user", "content": prompt}]
+    }, request_file)
+PY
+            timeout 30 aws bedrock-runtime invoke-model \
+              --region "\${BEDROCK_REGION:-${env.AWS_REGION}}" \
+              --model-id '${modelId}' \
+              --content-type 'application/json' \
+              --accept 'application/json' \
+              --cli-binary-format raw-in-base64-out \
+              --body "fileb://${requestFile}" \
+              '${responseFile}' >/dev/null 2>&1
+            BEDROCK_STATUS=\$?
+            BEDROCK_MODEL_ID_FOR_SUMMARY='${modelId}' python3 - '${responseFile}' '${summaryFile}' "\${BEDROCK_STATUS}" <<'PY'
+import json
+import os
+import sys
+
+response_path, summary_path, status = sys.argv[1], sys.argv[2], sys.argv[3]
+summary_text = ""
+error = ""
+if status == "0":
+    try:
+        with open(response_path, "r", encoding="utf-8") as response_file:
+            response = json.load(response_file)
+        if isinstance(response.get("content"), list) and response["content"]:
+            summary_text = response["content"][0].get("text", "")
+        elif isinstance(response.get("output"), dict):
+            content = response["output"].get("message", {}).get("content", [])
+            if content:
+                summary_text = content[0].get("text", "")
+        elif response.get("generation"):
+            summary_text = response.get("generation", "")
+        if not summary_text:
+            error = "Bedrock response parsing failed"
+    except Exception as exc:
+        error = f"Bedrock response parsing failed: {exc}"
+else:
+    error = f"Bedrock invoke-model failed with exit code {status}"
+
+payload = {
+    "enabled": True,
+    "provider": "bedrock",
+    "model": os.environ.get("BEDROCK_MODEL_ID_FOR_SUMMARY", "configured-via-jenkins-parameter"),
+    "status": "SUMMARY_CREATED" if summary_text else "SUMMARY_FAILED",
+    "summary_for_slack": summary_text if summary_text else "AI Failure Summary failed. Check Jenkins console and AWS deployment logs manually.",
+    "error": error,
+    "masked": True,
+}
+with open(summary_path, "w", encoding="utf-8") as summary_file:
+    json.dump(payload, summary_file, indent=2, ensure_ascii=False)
+PY
+            exit 0
+        """
+    )
+    Map parsed = [
+        enabled          : true,
+        provider         : 'bedrock',
+        status           : 'SUMMARY_FAILED',
+        error            : "AI summary shell wrapper failed with exit code ${status}",
+        summary_for_slack: 'AI Failure Summary failed. Check Jenkins console and AWS deployment logs manually.',
+        masked           : true
+    ]
+    try {
+        if (fileExists(summaryFile)) {
+            parsed = new groovy.json.JsonSlurperClassic().parseText(readFile(summaryFile))
+        }
+    } catch (Exception ignored) {
+        echo 'AI failure summary: unable to parse summary file; using failed fallback.'
+    }
+    parsed.failed_stage = metadata.failed_stage ?: 'N/A'
+    parsed.estimated_cause = parsed.summary_for_slack ?: 'N/A'
+    parsed.evidence = metadata.evidence ?: 'N/A'
+    parsed.impact = metadata.impact ?: 'N/A'
+    parsed.rollback_status = metadata.rollback_status ?: 'N/A'
+    parsed.next_action = parsed.summary_for_slack ?: 'N/A'
+    parsed.masked = true
+    writeAiFailureSummaryArtifact(serviceType, parsed)
+    sh(returnStatus: true, script: "rm -f '${promptFile}' '${requestFile}' '${responseFile}' '${summaryFile}'")
+    return parsed
+}
+
+def sendAiFailureSummarySlack(String title, Map summary, Map details) {
+    sendSlackNotification(title, [
+        Service                 : details.service ?: 'N/A',
+        Target                  : details.target ?: 'N/A',
+        Job                     : env.JOB_NAME,
+        Build                   : env.BUILD_NUMBER,
+        'Failed Stage'          : details.failed_stage ?: 'N/A',
+        'AI Summary Status'     : summary.status ?: 'N/A',
+        'Estimated Cause'       : summary.summary_for_slack ?: summary.estimated_cause ?: 'N/A',
+        Rollback                : details.rollback_status ?: 'N/A',
+        'Compensation Rollback' : details.compensation_rollback ?: 'N/A',
+        'Next Action'           : summary.next_action ?: 'Worker CloudWatch Logs에서 startup error, import error, model loading error, env 누락 여부를 확인하세요.',
+        Jenkins                 : maskSensitiveText(env.BUILD_URL ?: 'N/A')
+    ])
+}
+
+def generateWorkerAiFailureSummary() {
+    try {
+        Map trivy = readTrivySummary('worker')
+        String baseName = env.ECS_CLUSTER_NAME.replace('-cluster', '')
+        Map freeDiagnostics = collectWorkerServiceDiagnostics(env.FREE_ECS_SERVICE_NAME, "/ecs/${baseName}-free-worker")
+        Map paidDiagnostics = collectWorkerServiceDiagnostics(env.PAID_ECS_SERVICE_NAME, "/ecs/${baseName}-paid-worker")
+        String rollbackStatus = (env.FREE_UPDATE_REQUESTED == 'true' || env.PAID_UPDATE_REQUESTED == 'true') ?
+            (env.WORKER_ROLLBACK_RESULT ?: 'ROLLBACK_NOT_COMPLETED') : 'ROLLBACK_NOT_REQUIRED'
+        String target = env.PAID_UPDATE_REQUESTED == 'true' ? 'Paid Worker' :
+            (env.FREE_UPDATE_REQUESTED == 'true' ? 'Free Worker' : 'Worker Build/Pre-Deploy')
+        String impact = (env.FREE_UPDATE_REQUESTED == 'true' || env.PAID_UPDATE_REQUESTED == 'true') ?
+            'Worker ECS Service Update 이후 실패하여 Free/Paid rollback 결과 확인이 필요합니다.' :
+            'Worker ECS Service Update 전 실패이므로 운영 Worker service 변경은 없습니다.'
+        String compensationRollback = env.PAID_UPDATE_REQUESTED == 'true' ? 'FREE_COMPENSATING_ROLLBACK_REQUIRED' : 'N/A'
+        Map context = [
+            job_name                         : env.JOB_NAME,
+            build_number                     : env.BUILD_NUMBER,
+            build_url                        : maskSensitiveText(env.BUILD_URL ?: 'N/A'),
+            git_commit                       : env.GIT_COMMIT_SHA ?: env.GIT_SHORT_SHA ?: 'N/A',
+            git_short_sha                    : env.GIT_SHORT_SHA ?: 'N/A',
+            image_uri                        : maskSensitiveText(env.IMAGE_URI ?: 'N/A'),
+            image_digest                     : env.IMAGE_DIGEST ?: 'N/A',
+            deploy_phase                     : env.DEPLOY_PHASE ?: 'N/A',
+            free_update_requested            : env.FREE_UPDATE_REQUESTED ?: 'false',
+            paid_update_requested            : env.PAID_UPDATE_REQUESTED ?: 'false',
+            free_baseline_task_definition    : maskSensitiveText(env.FREE_PREVIOUS_TASK_DEFINITION_ARN ?: 'N/A'),
+            paid_baseline_task_definition    : maskSensitiveText(env.PAID_PREVIOUS_TASK_DEFINITION_ARN ?: 'N/A'),
+            free_requested_task_definition   : maskSensitiveText(env.FREE_TASK_DEFINITION_ARN ?: 'N/A'),
+            paid_requested_task_definition   : maskSensitiveText(env.PAID_TASK_DEFINITION_ARN ?: 'N/A'),
+            free_final_task_definition       : maskSensitiveText(env.FREE_FINAL_TASK_DEFINITION_ARN ?: readEcsServiceRevisionSafely(env.FREE_ECS_SERVICE_NAME)),
+            paid_final_task_definition       : maskSensitiveText(env.PAID_FINAL_TASK_DEFINITION_ARN ?: readEcsServiceRevisionSafely(env.PAID_ECS_SERVICE_NAME)),
+            worker_rollback_result           : rollbackStatus,
+            free_compensation_rollback_result: compensationRollback,
+            trivy_status                     : trivy.status,
+            trivy_high_count                 : trivy.high_count,
+            trivy_critical_count             : trivy.critical_count,
+            jenkins_console_log_tail         : collectConsoleLogTail(),
+            free_worker_ecs_events           : freeDiagnostics.service_events,
+            paid_worker_ecs_events           : paidDiagnostics.service_events,
+            free_worker_stopped_tasks        : freeDiagnostics.stopped_tasks,
+            paid_worker_stopped_tasks        : paidDiagnostics.stopped_tasks,
+            free_worker_cloudwatch_logs_tail : freeDiagnostics.cloudwatch_logs,
+            paid_worker_cloudwatch_logs_tail : paidDiagnostics.cloudwatch_logs
+        ]
+        Map metadata = [
+            failed_stage         : env.DEPLOY_PHASE ?: 'N/A',
+            rollback_status      : rollbackStatus,
+            impact               : impact,
+            evidence             : "${freeDiagnostics.service_events}\n${paidDiagnostics.service_events}",
+            compensation_rollback: compensationRollback
+        ]
+        Map summary = invokeBedrockFailureSummary('worker', buildAiFailurePrompt('AI Worker', context), metadata)
+        sendAiFailureSummarySlack(':mag: Worker AI Failure Summary', summary, [
+            service              : 'AI Worker',
+            target               : target,
+            failed_stage         : env.DEPLOY_PHASE ?: 'N/A',
+            rollback_status      : rollbackStatus,
+            compensation_rollback: compensationRollback
+        ])
+    } catch (Exception ignored) {
+        echo 'AI failure summary for Worker failed but ignored.'
+        writeAiFailureSummaryArtifact('worker', [
+            enabled          : true,
+            provider         : 'bedrock',
+            status           : 'SUMMARY_FAILED',
+            error            : 'AI failure summary failed before or during helper execution',
+            summary_for_slack: 'AI Failure Summary failed. Check Jenkins console and AWS deployment logs manually.',
+            masked           : true
+        ])
     }
 }
 
@@ -91,6 +475,11 @@ pipeline {
             name: 'ROLLBACK_TEST_MODE',
             choices: ['NONE', 'FREE_VERIFY_FAIL', 'PAID_VERIFY_FAIL'],
             description: 'Worker automatic rollback verification only'
+        )
+        string(
+            name: 'BEDROCK_MODEL_ID',
+            defaultValue: '',
+            description: 'Optional Bedrock model id for AI Failure Summary. Leave empty to skip AI summary.'
         )
     }
 
@@ -1054,7 +1443,7 @@ PY
                     'Paid Worker Service'        : env.PAID_ECS_SERVICE_NAME,
                     'Paid Task Definition'       : env.PAID_TASK_DEFINITION_ARN,
                     'Jenkins Build URL'          : env.BUILD_URL
-                ])
+                ] + trivySlackDetails('worker'))
             }
         }
         unsuccessful {
@@ -1078,7 +1467,7 @@ PY
                     'Free Update Requested'      : env.FREE_UPDATE_REQUESTED,
                     'Paid Update Requested'      : env.PAID_UPDATE_REQUESTED,
                     'Jenkins Build URL'          : env.BUILD_URL
-                ])
+                ] + trivySlackDetails('worker'))
 
                 if (env.DEPLOY_PHASE == 'DEPLOY_SUCCESS') {
                     echo "Rollback skipped: Worker deployment verification already succeeded."
@@ -1400,6 +1789,7 @@ PY
                         'Jenkins Build URL'              : env.BUILD_URL
                     ])
                 }
+                generateWorkerAiFailureSummary()
             }
         }
         always {
@@ -1474,6 +1864,25 @@ try:
         trivy.update(json.load(trivy_file))
 except Exception:
     pass
+trivy.update({
+    "report_path": f"trivy-reports/trivy-worker-{value('BUILD_NUMBER')}.json",
+    "gate_enabled": False,
+    "gate_policy": "WARNING_ONLY",
+    "gate_result": "NOT_APPLIED",
+})
+
+ai_failure_summary = {
+    "enabled": True,
+    "provider": "bedrock",
+    "status": "SUMMARY_NOT_CREATED",
+    "masked": True,
+}
+ai_summary_path = f".ai-failure-summary-worker-{value('BUILD_NUMBER')}.json"
+try:
+    with open(ai_summary_path, "r", encoding="utf-8") as ai_summary_file:
+        ai_failure_summary.update(json.load(ai_summary_file))
+except Exception:
+    pass
 
 summary = {
     "schema_version": "1.0",
@@ -1515,6 +1924,9 @@ summary = {
         "mode": "WARNING",
         **trivy,
     },
+    "ai_failure_summary": ai_failure_summary,
+    "ecr_push_executed": value("IMAGE_DIGEST") != "N/A",
+    "ecs_deploy_executed": value("FREE_UPDATE_REQUESTED") == "true" or value("PAID_UPDATE_REQUESTED") == "true",
     "build_url": value("BUILD_URL"),
     "timestamp_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
 }
@@ -1545,7 +1957,8 @@ PY
                     script: '''
                         rm -f \
                           "deployment-summaries/deployment-summary-worker-${BUILD_NUMBER}.json" \
-                          ".trivy-result-worker-${BUILD_NUMBER}.json"
+                          ".trivy-result-worker-${BUILD_NUMBER}.json" \
+                          ".ai-failure-summary-worker-${BUILD_NUMBER}.json"
                     '''
                 )
             }
