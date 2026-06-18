@@ -209,21 +209,25 @@ def buildAiFailurePrompt(String serviceName, Map context) {
 아래 정보는 Jenkins Pipeline 실패 이후 수집된 메타데이터와 마스킹된 로그다.
 제공된 정보 안에서만 판단하고, 확정 원인이 아니라 "추정 원인"으로 표현해라.
 민감정보, 계정 ID, ARN, IP, URL, Secret, Token, DB 정보, Queue URL, S3 경로는 출력하지 마라.
-로그가 부족하면 "로그 부족"이라고 말해라.
-Trivy Warning Mode 결과는 현재 배포 차단 사유가 아니므로 실패 원인으로 단정하지 마라.
-Rollback이 성공했는지, 실패했는지, 또는 불필요했는지 구분해라.
+Jenkins console log tail이 LOG_COLLECTION_FAILED이면 Slack 요약에 언급하지 마라. 이것은 배포 실패 원인이 아니라 보조 로그 수집 제한이다.
+Trivy Mode가 WARNING이고 Gate가 NOT_APPLIED이면 Trivy findings를 배포 실패 원인이나 Next Action으로 쓰지 마라.
+내부 테스트 관련 파라미터나 테스트 맥락을 암시하는 표현은 출력하지 마라.
 Worker는 이번 범위에서 SQS/DLQ/RDS/S3/inference 런타임 원인 분석을 하지 말고 배포 실패 정보만 요약해라.
-Slack 메시지용으로 7줄 이내로 작성해라.
+Rollback 결과가 RECOVERY_VERIFIED이면 baseline revision으로 정상 복구된 것으로 표현해라.
+Rollback 결과가 ROLLBACK_FAILED이면 수동 복구 확인이 필요하다고 표현해라.
+Rollback 결과가 ROLLBACK_NOT_REQUIRED이면 rollback이 필요 없는 실패로 표현해라.
+Slack 운영 알림용으로 짧고 실무적으로 작성해라.
 
 출력 형식:
 
-[AI Failure Summary]
-1. 실패 위치:
-2. 추정 원인:
-3. 근거 로그:
-4. 영향 범위:
-5. Rollback 상태:
-6. 다음 조치:
+Likely Cause:
+<1~2문장. 실패 stage와 target 기준의 추정 원인만 작성>
+
+Rollback Status:
+<rollback result와 복구 여부를 1문장으로 작성>
+
+Next Action:
+<운영자가 다음에 확인할 위치만 1~2문장으로 작성>
 
 서비스: ${serviceName}
 입력 데이터:
@@ -242,6 +246,70 @@ def writeAiFailureSummaryArtifact(String serviceType, Map summary) {
         echo "AI failure summary: unable to write ${artifactPath}; ignored."
     }
     return artifactPath
+}
+
+def resolveWorkerAiSummaryTarget() {
+    if (env.FREE_UPDATE_REQUESTED == 'true' && env.PAID_UPDATE_REQUESTED == 'true') {
+        return 'Free/Paid Worker'
+    }
+    if (env.PAID_UPDATE_REQUESTED == 'true') {
+        return 'Paid Worker'
+    }
+    if (env.FREE_UPDATE_REQUESTED == 'true') {
+        return 'Free Worker'
+    }
+    return 'Worker Build/Pre-Deploy'
+}
+
+def fallbackWorkerLikelyCause(String failedStage, String target) {
+    if ((target ?: '').contains('Free/Paid')) {
+        return 'Worker 배포 검증 실패가 감지되었습니다.'
+    }
+    if ((target ?: '').contains('Paid')) {
+        return 'Paid Worker 배포 후 RUNNING 또는 revision 검증 단계에서 실패가 감지되었습니다.'
+    }
+    if ((target ?: '').contains('Free')) {
+        return 'Free Worker 배포 후 RUNNING 또는 revision 검증 단계에서 실패가 감지되었습니다.'
+    }
+    if ((failedStage ?: '').contains('SERVICE') || (failedStage ?: '').contains('VERIFY') || (failedStage ?: '').contains('VERIFICATION')) {
+        return 'Worker 배포 검증 단계에서 실패가 감지되었습니다.'
+    }
+    return 'ECS Service Update 이전 단계에서 실패했습니다.'
+}
+
+def fallbackWorkerRollbackStatusText(String rollbackStatus, String target, String compensationRollback) {
+    boolean compensationNeeded = compensationRollback != null && compensationRollback != 'N/A'
+    switch (rollbackStatus ?: 'N/A') {
+        case 'RECOVERY_VERIFIED':
+            if (compensationNeeded || (target ?: '').contains('Free/Paid')) {
+                return 'RECOVERY_VERIFIED — Worker rollback 및 필요한 보상 rollback 처리가 완료되었습니다.'
+            }
+            return 'RECOVERY_VERIFIED — baseline revision으로 정상 복구되었습니다.'
+        case 'ROLLBACK_FAILED':
+            return 'RECOVERY_FAILED — 수동 복구 확인이 필요합니다.'
+        case 'EXTERNAL_UPDATE_DETECTED':
+            return 'MANUAL_REVIEW_REQUIRED — 외부 업데이트가 감지되어 수동 확인이 필요합니다.'
+        case 'ROLLBACK_NOT_REQUIRED':
+            return 'NOT_REQUIRED'
+        case 'ROLLBACK_NOT_COMPLETED':
+            return 'NOT_COMPLETED — rollback 완료 여부 확인이 필요합니다.'
+        default:
+            return rollbackStatus ?: 'N/A'
+    }
+}
+
+def fallbackWorkerNextAction(String rollbackStatus, String target) {
+    switch (rollbackStatus ?: 'N/A') {
+        case 'ROLLBACK_FAILED':
+            return '즉시 ECS Service Events, stopped task reason, 현재 task definition revision, Free/Paid Worker final revision을 확인하고 baseline revision으로 수동 rollback을 검토하세요.'
+        case 'ROLLBACK_NOT_REQUIRED':
+            return '실패한 Jenkins stage의 build/test/docker/ecr 로그를 확인하세요.'
+        default:
+            if ((target ?: '').contains('Free/Paid')) {
+                return 'Free/Paid Worker의 final task definition revision, ECS Service Events, stopped task reason, Worker CloudWatch Logs를 확인하세요.'
+            }
+            return 'ECS Service Events, stopped task reason, Worker CloudWatch Logs, task definition revision, container startup error를 우선 확인하세요.'
+    }
 }
 
 def invokeBedrockFailureSummary(String serviceType, String prompt, Map metadata) {
@@ -306,6 +374,29 @@ import sys
 response_path, summary_path, status = sys.argv[1], sys.argv[2], sys.argv[3]
 summary_text = ""
 error = ""
+section_labels = ["Likely Cause", "Rollback Status", "Next Action"]
+
+def extract_sections(text):
+    sections = {label: "" for label in section_labels}
+    current = None
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        matched = None
+        for label in section_labels:
+            if line.lower().startswith(label.lower() + ":"):
+                matched = label
+                remainder = line[len(label) + 1:].strip()
+                sections[label] = remainder
+                break
+        if matched:
+            current = matched
+            continue
+        if current and line:
+            if sections[current]:
+                sections[current] += " "
+            sections[current] += line
+    return sections
+
 if status == "0":
     try:
         with open(response_path, "r", encoding="utf-8") as response_file:
@@ -325,12 +416,16 @@ if status == "0":
 else:
     error = f"Bedrock invoke-model failed with exit code {status}"
 
+sections = extract_sections(summary_text) if summary_text else {label: "" for label in section_labels}
 payload = {
     "enabled": True,
     "provider": "bedrock",
     "model": os.environ.get("BEDROCK_MODEL_ID_FOR_SUMMARY", "configured-via-jenkins-parameter"),
     "status": "SUMMARY_CREATED" if summary_text else "SUMMARY_FAILED",
     "summary_for_slack": summary_text if summary_text else "AI Failure Summary failed. Check Jenkins console and AWS deployment logs manually.",
+    "likely_cause": sections.get("Likely Cause", ""),
+    "rollback_status_text": sections.get("Rollback Status", ""),
+    "next_action": sections.get("Next Action", ""),
     "error": error,
     "masked": True,
 }
@@ -356,11 +451,14 @@ PY
         echo 'AI failure summary: unable to parse summary file; using failed fallback.'
     }
     parsed.failed_stage = metadata.failed_stage ?: 'N/A'
-    parsed.estimated_cause = parsed.summary_for_slack ?: 'N/A'
+    parsed.likely_cause = parsed.likely_cause ?: fallbackWorkerLikelyCause(parsed.failed_stage, metadata.target ?: 'Unknown')
     parsed.evidence = metadata.evidence ?: 'N/A'
     parsed.impact = metadata.impact ?: 'N/A'
     parsed.rollback_status = metadata.rollback_status ?: 'N/A'
-    parsed.next_action = parsed.summary_for_slack ?: 'N/A'
+    parsed.compensation_rollback = metadata.compensation_rollback ?: 'N/A'
+    parsed.rollback_status_text = parsed.rollback_status_text ?:
+        fallbackWorkerRollbackStatusText(parsed.rollback_status, metadata.target ?: 'Unknown', parsed.compensation_rollback)
+    parsed.next_action = parsed.next_action ?: fallbackWorkerNextAction(parsed.rollback_status, metadata.target ?: 'Unknown')
     parsed.masked = true
     writeAiFailureSummaryArtifact(serviceType, parsed)
     sh(returnStatus: true, script: "rm -f '${promptFile}' '${requestFile}' '${responseFile}' '${summaryFile}'")
@@ -369,17 +467,17 @@ PY
 
 def sendAiFailureSummarySlack(String title, Map summary, Map details) {
     sendSlackNotification(title, [
-        Service                 : details.service ?: 'N/A',
-        Target                  : details.target ?: 'N/A',
-        Job                     : env.JOB_NAME,
-        Build                   : env.BUILD_NUMBER,
-        'Failed Stage'          : details.failed_stage ?: 'N/A',
-        'AI Summary Status'     : summary.status ?: 'N/A',
-        'Estimated Cause'       : summary.summary_for_slack ?: summary.estimated_cause ?: 'N/A',
-        Rollback                : details.rollback_status ?: 'N/A',
-        'Compensation Rollback' : details.compensation_rollback ?: 'N/A',
-        'Next Action'           : summary.next_action ?: 'Worker CloudWatch Logs에서 startup error, import error, model loading error, env 누락 여부를 확인하세요.',
-        Jenkins                 : maskSensitiveText(env.BUILD_URL ?: 'N/A')
+        Service            : details.service ?: 'N/A',
+        Target             : details.target ?: 'N/A',
+        Job                : env.JOB_NAME,
+        Build              : env.BUILD_NUMBER,
+        'Failed Stage'     : details.failed_stage ?: 'N/A',
+        'AI Summary Status': summary.status ?: 'N/A',
+        'Likely Cause'     : summary.likely_cause ?: fallbackWorkerLikelyCause(details.failed_stage ?: 'N/A', details.target ?: 'Unknown'),
+        'Rollback Status'  : summary.rollback_status_text ?:
+            fallbackWorkerRollbackStatusText(details.rollback_status ?: 'N/A', details.target ?: 'Unknown', details.compensation_rollback ?: 'N/A'),
+        'Next Action'      : summary.next_action ?: fallbackWorkerNextAction(details.rollback_status ?: 'N/A', details.target ?: 'Unknown'),
+        Jenkins            : maskSensitiveText(env.BUILD_URL ?: 'N/A')
     ])
 }
 
@@ -391,8 +489,7 @@ def generateWorkerAiFailureSummary() {
         Map paidDiagnostics = collectWorkerServiceDiagnostics(env.PAID_ECS_SERVICE_NAME, "/ecs/${baseName}-paid-worker")
         String rollbackStatus = (env.FREE_UPDATE_REQUESTED == 'true' || env.PAID_UPDATE_REQUESTED == 'true') ?
             (env.WORKER_ROLLBACK_RESULT ?: 'ROLLBACK_NOT_COMPLETED') : 'ROLLBACK_NOT_REQUIRED'
-        String target = env.PAID_UPDATE_REQUESTED == 'true' ? 'Paid Worker' :
-            (env.FREE_UPDATE_REQUESTED == 'true' ? 'Free Worker' : 'Worker Build/Pre-Deploy')
+        String target = resolveWorkerAiSummaryTarget()
         String impact = (env.FREE_UPDATE_REQUESTED == 'true' || env.PAID_UPDATE_REQUESTED == 'true') ?
             'Worker ECS Service Update 이후 실패하여 Free/Paid rollback 결과 확인이 필요합니다.' :
             'Worker ECS Service Update 전 실패이므로 운영 Worker service 변경은 없습니다.'
@@ -419,6 +516,8 @@ def generateWorkerAiFailureSummary() {
             trivy_status                     : trivy.status,
             trivy_high_count                 : trivy.high_count,
             trivy_critical_count             : trivy.critical_count,
+            trivy_mode                       : 'WARNING',
+            trivy_gate                       : 'NOT_APPLIED',
             jenkins_console_log_tail         : collectConsoleLogTail(),
             free_worker_ecs_events           : freeDiagnostics.service_events,
             paid_worker_ecs_events           : paidDiagnostics.service_events,
@@ -432,7 +531,8 @@ def generateWorkerAiFailureSummary() {
             rollback_status      : rollbackStatus,
             impact               : impact,
             evidence             : "${freeDiagnostics.service_events}\n${paidDiagnostics.service_events}",
-            compensation_rollback: compensationRollback
+            compensation_rollback: compensationRollback,
+            target               : target
         ]
         Map summary = invokeBedrockFailureSummary('worker', buildAiFailurePrompt('AI Worker', context), metadata)
         sendAiFailureSummarySlack(':mag: Worker AI Failure Summary', summary, [
