@@ -660,7 +660,7 @@ pipeline {
         )
         string(
             name: 'BEDROCK_MODEL_ID',
-            defaultValue: '',
+            defaultValue: 'anthropic.claude-3-haiku-20240307-v1:0',
             description: 'Optional Bedrock model id for AI Failure Summary. Leave empty to skip AI summary.'
         )
     }
