@@ -2,6 +2,10 @@ def slackDisplay(value) {
     return value == null || value.toString().trim() == '' ? 'N/A' : value.toString()
 }
 
+def workerRunbookLink() {
+    return '<https://github.com/taekyoung23/cicd-test-ai-worker/blob/ktk-cicd/docs/runbooks/worker-deployment-runbook.md|운영 가이드>'
+}
+
 def sendSlackNotification(String title, Map details) {
     String messageFile = ".slack-message-${env.BUILD_NUMBER ?: 'unknown'}.txt"
     String payloadFile = ".slack-payload-${env.BUILD_NUMBER ?: 'unknown'}.json"
@@ -559,7 +563,8 @@ def sendAiFailureSummarySlack(String title, Map summary, Map details) {
         'Rollback Status'  : summary.rollback_status_text ?:
             fallbackWorkerRollbackStatusText(details.rollback_status ?: 'N/A', details.target ?: 'Unknown', details.compensation_rollback ?: 'N/A'),
         'Next Action'      : summary.next_action ?: fallbackWorkerNextAction(details.rollback_status ?: 'N/A', details.target ?: 'Unknown'),
-        Jenkins            : maskSensitiveText(env.BUILD_URL ?: 'N/A')
+        Jenkins            : maskSensitiveText(env.BUILD_URL ?: 'N/A'),
+        Runbook            : workerRunbookLink()
     ])
 }
 
@@ -1648,7 +1653,8 @@ PY
                     'Paid Worker Service'        : env.PAID_ECS_SERVICE_NAME,
                     'Free Update Requested'      : env.FREE_UPDATE_REQUESTED,
                     'Paid Update Requested'      : env.PAID_UPDATE_REQUESTED,
-                    'Jenkins Build URL'          : env.BUILD_URL
+                    'Jenkins Build URL'          : env.BUILD_URL,
+                    Runbook                      : workerRunbookLink()
                 ] + trivySlackDetails('worker'))
 
                 if (env.DEPLOY_PHASE == 'DEPLOY_SUCCESS') {
@@ -1968,7 +1974,8 @@ PY
                         'Paid Baseline Restored'         : env.PAID_FINAL_TASK_DEFINITION_ARN == env.PAID_PREVIOUS_TASK_DEFINITION_ARN,
                         'Paid Deployment Started'        : env.PAID_UPDATE_REQUESTED,
                         'Deploy Phase'                   : env.DEPLOY_PHASE,
-                        'Jenkins Build URL'              : env.BUILD_URL
+                        'Jenkins Build URL'              : env.BUILD_URL,
+                        Runbook                          : workerRunbookLink()
                     ])
                 }
                 generateWorkerAiFailureSummary()
