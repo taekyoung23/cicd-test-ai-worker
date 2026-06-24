@@ -978,10 +978,15 @@ PY
             }
         }
 
-        // 롤백 대상은 단순 이전 번호가 아니라 배포 직전 각 Service가 실제 사용하던 Revision입니다.
-        stage('Capture Worker Deployment Baseline') {
+        // Free/Paid Worker 배포와 검증을 하나의 Stage에서 순차 처리합니다.
+        stage('Worker Deploy & Verify') {
+            options {
+                // targeted polling으로 배포 시간을 줄이되 전체 배포 구간은 제한합니다.
+                timeout(time: 15, unit: 'MINUTES')
+            }
             steps {
                 script {
+                    echo '[Free] Baseline Capture'
                     env.FREE_PREVIOUS_TASK_DEFINITION_ARN = sh(
                         script: '''
                             set -eu
@@ -994,6 +999,7 @@ PY
                         ''',
                         returnStdout: true
                     ).trim()
+                    echo '[Paid] Baseline Capture'
                     env.PAID_PREVIOUS_TASK_DEFINITION_ARN = sh(
                         script: '''
                             set -eu
@@ -1078,14 +1084,9 @@ PY
                         echo 'Warning: Free/Paid rollback baselines use different images. Each service will still be restored to its own captured baseline.'
                     }
                 }
-            }
-        }
 
-        // 공통 이미지를 Free Worker에 먼저 등록하고 배포합니다.
-        stage('Free Worker Deploy') {
-            steps {
                 script {
-                    // 중복 Revision 생성을 방지하기 위해 Free Worker 등록 명령은 재시도하지 않습니다.
+                    echo '[Free] Register Task Definition'
                     env.FREE_TASK_DEFINITION_ARN = sh(
                         script: '''
                             set -eu
@@ -1141,10 +1142,9 @@ PY
                         returnStdout: true
                     ).trim()
                     echo "Registered Free Worker task definition: ${env.FREE_TASK_DEFINITION_ARN}"
-                }
-                // 안정화 대기 전에 Free Worker Service Update를 한 번만 실행합니다.
-                script {
+
                     env.DEPLOY_PHASE = 'FREE_SERVICE_UPDATE'
+                    echo '[Free] Service Update'
                     sh '''
                         set -eu
                         CIRCUIT_BREAKER="$(aws ecs describe-services \
@@ -1169,174 +1169,165 @@ PY
                           --service "${FREE_ECS_SERVICE_NAME}" \
                           --task-definition "${FREE_TASK_DEFINITION_ARN}" \
                           --no-cli-pager >/dev/null
-                        echo "Free Worker service update requested using ${IMAGE_URI}"
+                        echo "[Free] service update requested using ${IMAGE_URI}"
+                    '''
+
+                    env.DEPLOY_PHASE = 'FREE_SERVICE_STABILIZATION_FAILED'
+                    echo '[Free] Targeted Stable Check'
+                    sh '''
+                        set -eu
+
+                        wait_for_worker_revision_running() {
+                          LABEL="$1"
+                          SERVICE_NAME="$2"
+                          EXPECTED_REVISION="$3"
+                          OBSERVATION_SECONDS="${4:-15}"
+                          MAX_ATTEMPTS="${5:-36}"
+                          SLEEP_SECONDS="${6:-5}"
+                          MATCHING_TASK_ARNS=""
+
+                          attempt=1
+                          while [ "${attempt}" -le "${MAX_ATTEMPTS}" ]; do
+                            SERVICE_JSON="$(aws ecs describe-services \
+                              --region "${AWS_REGION}" \
+                              --cluster "${ECS_CLUSTER_NAME}" \
+                              --services "${SERVICE_NAME}" \
+                              --query 'services[0].{TaskDefinition:taskDefinition,Desired:desiredCount,Running:runningCount,Pending:pendingCount}' \
+                              --output json)"
+                            CURRENT_REVISION="$(printf '%s' "${SERVICE_JSON}" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("TaskDefinition", ""))')"
+                            DESIRED_COUNT="$(printf '%s' "${SERVICE_JSON}" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("Desired", 0))')"
+                            RUNNING_COUNT="$(printf '%s' "${SERVICE_JSON}" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("Running", 0))')"
+                            PENDING_COUNT="$(printf '%s' "${SERVICE_JSON}" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("Pending", 0))')"
+
+                            if ! printf '%s' "${DESIRED_COUNT}" | grep -Eq '^[0-9]+$'; then
+                              echo "[${LABEL}] invalid desired count: ${DESIRED_COUNT}"
+                              exit 1
+                            fi
+                            if [ "${DESIRED_COUNT}" -lt 1 ]; then
+                              echo "[${LABEL}] desired count is 0. Worker RUNNING verification requires at least one task."
+                              exit 1
+                            fi
+
+                            TASK_ARNS="$(aws ecs list-tasks \
+                              --region "${AWS_REGION}" \
+                              --cluster "${ECS_CLUSTER_NAME}" \
+                              --service-name "${SERVICE_NAME}" \
+                              --desired-status RUNNING \
+                              --query 'taskArns' \
+                              --output text)"
+                            MATCHING_TASK_ARNS=""
+                            MATCHING_COUNT="0"
+                            if [ -n "${TASK_ARNS}" ] && [ "${TASK_ARNS}" != "None" ]; then
+                              MATCHING_TASK_ARNS="$(aws ecs describe-tasks \
+                                --region "${AWS_REGION}" \
+                                --cluster "${ECS_CLUSTER_NAME}" \
+                                --tasks ${TASK_ARNS} \
+                                --query "tasks[?taskDefinitionArn=='${EXPECTED_REVISION}'].taskArn" \
+                                --output text)"
+                              if [ -n "${MATCHING_TASK_ARNS}" ] && [ "${MATCHING_TASK_ARNS}" != "None" ]; then
+                                MATCHING_COUNT="$(printf '%s\n' ${MATCHING_TASK_ARNS} | wc -w | tr -d ' ')"
+                              fi
+                            fi
+
+                            echo "[${LABEL}] poll ${attempt}/${MAX_ATTEMPTS}: serviceRevision=${CURRENT_REVISION}, desired=${DESIRED_COUNT}, running=${RUNNING_COUNT}, pending=${PENDING_COUNT}, matchingRevisionTasks=${MATCHING_COUNT}"
+
+                            if [ "${CURRENT_REVISION}" = "${EXPECTED_REVISION}" ] && [ "${MATCHING_COUNT}" -ge "${DESIRED_COUNT}" ]; then
+                              echo "[${LABEL}] requested revision has ${MATCHING_COUNT}/${DESIRED_COUNT} RUNNING task(s)."
+                              echo "[${LABEL}] observing RUNNING tasks for ${OBSERVATION_SECONDS}s."
+                              sleep "${OBSERVATION_SECONDS}"
+
+                              FINAL_REVISION="$(aws ecs describe-services \
+                                --region "${AWS_REGION}" \
+                                --cluster "${ECS_CLUSTER_NAME}" \
+                                --services "${SERVICE_NAME}" \
+                                --query 'services[0].taskDefinition' \
+                                --output text)"
+                              if [ "${FINAL_REVISION}" != "${EXPECTED_REVISION}" ]; then
+                                echo "[${LABEL}] service revision changed during observation: ${FINAL_REVISION}"
+                                exit 1
+                              fi
+
+                              NON_RUNNING_TASKS="$(aws ecs describe-tasks \
+                                --region "${AWS_REGION}" \
+                                --cluster "${ECS_CLUSTER_NAME}" \
+                                --tasks ${MATCHING_TASK_ARNS} \
+                                --query "tasks[?lastStatus!='RUNNING'].taskArn" \
+                                --output text)"
+                              if [ -n "${NON_RUNNING_TASKS}" ] && [ "${NON_RUNNING_TASKS}" != "None" ]; then
+                                echo "[${LABEL}] requested revision tasks did not remain RUNNING: ${NON_RUNNING_TASKS}"
+                                exit 1
+                              fi
+
+                              echo "[${LABEL}] targeted stable check passed."
+                              return 0
+                            fi
+
+                            attempt=$((attempt + 1))
+                            sleep "${SLEEP_SECONDS}"
+                          done
+
+                          echo "[${LABEL}] targeted stable check timed out."
+                          aws ecs describe-services \
+                            --region "${AWS_REGION}" \
+                            --cluster "${ECS_CLUSTER_NAME}" \
+                            --services "${SERVICE_NAME}" \
+                            --query 'services[0].deployments[].{Status:status,RolloutState:rolloutState,TaskDefinition:taskDefinition,Desired:desiredCount,Running:runningCount,Failed:failedTasks}' \
+                            --output table || true
+                          aws ecs describe-services \
+                            --region "${AWS_REGION}" \
+                            --cluster "${ECS_CLUSTER_NAME}" \
+                            --services "${SERVICE_NAME}" \
+                            --query 'services[0].events[0:10].[createdAt,message]' \
+                            --output table || true
+                          exit 1
+                        }
+
+                        wait_for_worker_revision_running "Free" "${FREE_ECS_SERVICE_NAME}" "${FREE_TASK_DEFINITION_ARN}" 15
+                    '''
+
+                    env.DEPLOY_PHASE = 'FREE_POST_DEPLOY_VERIFICATION_FAILED'
+                    echo '[Free] Revision Verification'
+                    sh '''
+                        set -eu
+                        FINAL_FREE_TASK_DEFINITION_ARN="$(aws ecs describe-services \
+                          --region "${AWS_REGION}" \
+                          --cluster "${ECS_CLUSTER_NAME}" \
+                          --services "${FREE_ECS_SERVICE_NAME}" \
+                          --query 'services[0].taskDefinition' \
+                          --output text)"
+                        echo "Requested Free Worker task definition: ${FREE_TASK_DEFINITION_ARN}"
+                        echo "Final Free Worker task definition: ${FINAL_FREE_TASK_DEFINITION_ARN}"
+                        if [ "${FINAL_FREE_TASK_DEFINITION_ARN}" != "${FREE_TASK_DEFINITION_ARN}" ]; then
+                          echo "Free Worker service revision changed before post-deploy verification completed."
+                          exit 1
+                        fi
+                        if [ "${ROLLBACK_TEST_MODE:-NONE}" = "FREE_VERIFY_FAIL" ]; then
+                          echo "Intentional Free Worker verification failure for rollback test."
+                          exit 1
+                        fi
+                        STOPPED_TASK_ARNS="$(aws ecs list-tasks \
+                          --region "${AWS_REGION}" \
+                          --cluster "${ECS_CLUSTER_NAME}" \
+                          --service-name "${FREE_ECS_SERVICE_NAME}" \
+                          --desired-status STOPPED \
+                          --max-results 5 \
+                          --query 'taskArns' \
+                          --output text)"
+                        if [ -n "${STOPPED_TASK_ARNS}" ] && [ "${STOPPED_TASK_ARNS}" != "None" ]; then
+                          aws ecs describe-tasks \
+                            --region "${AWS_REGION}" \
+                            --cluster "${ECS_CLUSTER_NAME}" \
+                            --tasks ${STOPPED_TASK_ARNS} \
+                            --query 'tasks[].[taskArn,stopCode,stoppedReason]' \
+                            --output table || true
+                        fi
+                        echo "[Free] Verification Passed for ${FREE_TASK_DEFINITION_ARN}"
                     '''
                 }
-            }
-        }
 
-        // Free Worker가 안정 상태에 도달하지 못하면 Pipeline을 중단합니다.
-        stage('Free Worker Stable Wait') {
-            options {
-                // ECS 안정화를 무기한 기다리지 않고 제한 시간을 초과하면 실패 처리합니다.
-                timeout(time: 15, unit: 'MINUTES')
-            }
-            steps {
                 script {
-                    env.DEPLOY_PHASE = 'FREE_SERVICE_STABILIZATION_FAILED'
-                }
-                sh '''
-                    set -eu
-                    WAIT_EXIT=0
-                    set +e
-                    aws ecs wait services-stable \
-                      --region "${AWS_REGION}" \
-                      --cluster "${ECS_CLUSTER_NAME}" \
-                      --services "${FREE_ECS_SERVICE_NAME}" || WAIT_EXIT=$?
-                    set -e
-
-                    aws ecs describe-services \
-                      --region "${AWS_REGION}" \
-                      --cluster "${ECS_CLUSTER_NAME}" \
-                      --services "${FREE_ECS_SERVICE_NAME}" \
-                      --query 'services[0].deployments[].{Status:status,RolloutState:rolloutState,TaskDefinition:taskDefinition,Desired:desiredCount,Running:runningCount,Failed:failedTasks}' \
-                      --output table
-
-                    aws ecs describe-services \
-                      --region "${AWS_REGION}" \
-                      --cluster "${ECS_CLUSTER_NAME}" \
-                      --services "${FREE_ECS_SERVICE_NAME}" \
-                      --query 'services[0].events[0:10].[createdAt,message]' \
-                      --output table
-
-                    FINAL_FREE_TASK_DEFINITION_ARN="$(aws ecs describe-services \
-                      --region "${AWS_REGION}" \
-                      --cluster "${ECS_CLUSTER_NAME}" \
-                      --services "${FREE_ECS_SERVICE_NAME}" \
-                      --query 'services[0].taskDefinition' \
-                      --output text)"
-
-                    echo "Requested Free Worker task definition: ${FREE_TASK_DEFINITION_ARN}"
-                    echo "Final Free Worker task definition: ${FINAL_FREE_TASK_DEFINITION_ARN}"
-
-                    if [ "${WAIT_EXIT}" -ne 0 ]; then
-                      echo "Free Worker did not reach stable state. Paid Worker deployment will not start."
-                      exit "${WAIT_EXIT}"
-                    fi
-
-                    if [ "${FINAL_FREE_TASK_DEFINITION_ARN}" != "${FREE_TASK_DEFINITION_ARN}" ]; then
-                      echo "Requested Free Worker revision is not active. ECS Circuit Breaker rollback or another service update occurred."
-                      echo "Paid Worker deployment will not start."
-                      exit 1
-                    fi
-
-                    echo "Free Worker service is stable: ${FREE_ECS_SERVICE_NAME}"
-                '''
-            }
-        }
-
-        // Free Worker가 예상 Revision으로 실행되고 관찰 시간 동안 RUNNING 상태를 유지하는지 확인합니다.
-        stage('Free Worker Post-Deploy Verification') {
-            options {
-                // 이 검증은 배포 안정성을 확인하며 실제 SQS 메시지 처리 성공까지 검증하지는 않습니다.
-                timeout(time: 5, unit: 'MINUTES')
-            }
-            steps {
-                script {
-                    env.DEPLOY_PHASE = 'FREE_POST_DEPLOY_VERIFICATION_FAILED'
-                }
-                sh '''
-                    set -eu
-
-                    FINAL_FREE_TASK_DEFINITION_ARN="$(aws ecs describe-services \
-                      --region "${AWS_REGION}" \
-                      --cluster "${ECS_CLUSTER_NAME}" \
-                      --services "${FREE_ECS_SERVICE_NAME}" \
-                      --query 'services[0].taskDefinition' \
-                      --output text)"
-
-                    if [ "${FINAL_FREE_TASK_DEFINITION_ARN}" != "${FREE_TASK_DEFINITION_ARN}" ]; then
-                      echo "Free Worker service revision changed before post-deploy verification completed."
-                      echo "Requested task definition: ${FREE_TASK_DEFINITION_ARN}"
-                      echo "Final service task definition: ${FINAL_FREE_TASK_DEFINITION_ARN}"
-                      exit 1
-                    fi
-
-                    if [ "${ROLLBACK_TEST_MODE:-NONE}" = "FREE_VERIFY_FAIL" ]; then
-                      echo "Intentional Free Worker verification failure for rollback test."
-                      exit 1
-                    fi
-
-                    FREE_RUNNING_TASK_ARNS="$(aws ecs list-tasks \
-                      --region "${AWS_REGION}" \
-                      --cluster "${ECS_CLUSTER_NAME}" \
-                      --service-name "${FREE_ECS_SERVICE_NAME}" \
-                      --desired-status RUNNING \
-                      --query 'taskArns' \
-                      --output text)"
-
-                    if [ -z "${FREE_RUNNING_TASK_ARNS}" ] || [ "${FREE_RUNNING_TASK_ARNS}" = "None" ]; then
-                      echo "No RUNNING Free Worker tasks found."
-                      exit 1
-                    fi
-
-                    UNEXPECTED_TASKS="$(aws ecs describe-tasks \
-                      --region "${AWS_REGION}" \
-                      --cluster "${ECS_CLUSTER_NAME}" \
-                      --tasks ${FREE_RUNNING_TASK_ARNS} \
-                      --query "tasks[?taskDefinitionArn!='${FREE_TASK_DEFINITION_ARN}'].taskArn" \
-                      --output text)"
-
-                    if [ -n "${UNEXPECTED_TASKS}" ] && [ "${UNEXPECTED_TASKS}" != "None" ]; then
-                      echo "Free Worker tasks use an unexpected task definition: ${UNEXPECTED_TASKS}"
-                      exit 1
-                    fi
-
-                    sleep 30
-
-                    # 짧은 Crash Loop를 감지하기 위해 관찰 시간 후 동일 Task ARN 상태를 다시 확인합니다.
-                    NON_RUNNING_TASKS="$(aws ecs describe-tasks \
-                      --region "${AWS_REGION}" \
-                      --cluster "${ECS_CLUSTER_NAME}" \
-                      --tasks ${FREE_RUNNING_TASK_ARNS} \
-                      --query "tasks[?lastStatus!='RUNNING'].taskArn" \
-                      --output text)"
-
-                    if [ -n "${NON_RUNNING_TASKS}" ] && [ "${NON_RUNNING_TASKS}" != "None" ]; then
-                      echo "Free Worker tasks did not remain RUNNING: ${NON_RUNNING_TASKS}"
-                      exit 1
-                    fi
-
-                    STOPPED_TASK_ARNS="$(aws ecs list-tasks \
-                      --region "${AWS_REGION}" \
-                      --cluster "${ECS_CLUSTER_NAME}" \
-                      --service-name "${FREE_ECS_SERVICE_NAME}" \
-                      --desired-status STOPPED \
-                      --max-results 5 \
-                      --query 'taskArns' \
-                      --output text)"
-
-                    if [ -n "${STOPPED_TASK_ARNS}" ] && [ "${STOPPED_TASK_ARNS}" != "None" ]; then
-                      # 정상 Rolling Update도 이전 Task를 중지하므로 중지 Task 정보는 참고용으로 출력합니다.
-                      aws ecs describe-tasks \
-                        --region "${AWS_REGION}" \
-                        --cluster "${ECS_CLUSTER_NAME}" \
-                        --tasks ${STOPPED_TASK_ARNS} \
-                        --query 'tasks[].[taskArn,stopCode,stoppedReason]' \
-                        --output table || true
-                    fi
-
-                    echo "Free Worker post-deploy verification passed for ${FREE_TASK_DEFINITION_ARN}"
-                '''
-            }
-        }
-
-        // Free Worker 배포와 검증이 성공한 후 동일한 IMAGE_URI를 Paid Worker에 배포합니다.
-        stage('Paid Worker Deploy') {
-            steps {
-                script {
+                    echo '[Paid] Register Task Definition'
                     env.DEPLOY_PHASE = 'PAID_DEPLOY_PRE_UPDATE_FAILED'
-                    // Free Worker 배포 후 검증이 통과한 경우에만 Paid Worker Revision을 등록합니다.
                     env.PAID_TASK_DEFINITION_ARN = sh(
                         script: '''
                             set -eu
@@ -1391,10 +1382,9 @@ PY
                         returnStdout: true
                     ).trim()
                     echo "Registered Paid Worker task definition: ${env.PAID_TASK_DEFINITION_ARN}"
-                }
-                // Free와 Paid Worker Service 모두 동일한 IMAGE_URI를 사용합니다.
-                script {
+
                     env.DEPLOY_PHASE = 'PAID_SERVICE_UPDATE'
+                    echo '[Paid] Service Update'
                     sh '''
                         set -eu
                         CIRCUIT_BREAKER="$(aws ecs describe-services \
@@ -1419,173 +1409,163 @@ PY
                           --service "${PAID_ECS_SERVICE_NAME}" \
                           --task-definition "${PAID_TASK_DEFINITION_ARN}" \
                           --no-cli-pager >/dev/null
-                        echo "Paid Worker service update requested using ${IMAGE_URI}"
+                        echo "[Paid] service update requested using ${IMAGE_URI}"
                     '''
-                }
-            }
-        }
 
-        // Free Worker 성공 후 Paid Worker가 안정화되지 않으면 Pipeline을 실패 처리합니다.
-        stage('Paid Worker Stable Wait') {
-            options {
-                // Free Worker 성공 후 Paid Worker 배포도 제한 시간 안에 안정화되어야 합니다.
-                timeout(time: 15, unit: 'MINUTES')
-            }
-            steps {
-                script {
                     env.DEPLOY_PHASE = 'PAID_SERVICE_STABILIZATION_FAILED'
-                }
-                sh '''
-                    set -eu
-                    WAIT_EXIT=0
-                    set +e
-                    aws ecs wait services-stable \
-                      --region "${AWS_REGION}" \
-                      --cluster "${ECS_CLUSTER_NAME}" \
-                      --services "${PAID_ECS_SERVICE_NAME}" || WAIT_EXIT=$?
-                    set -e
+                    echo '[Paid] Targeted Stable Check'
+                    sh '''
+                        set -eu
 
-                    aws ecs describe-services \
-                      --region "${AWS_REGION}" \
-                      --cluster "${ECS_CLUSTER_NAME}" \
-                      --services "${PAID_ECS_SERVICE_NAME}" \
-                      --query 'services[0].deployments[].{Status:status,RolloutState:rolloutState,TaskDefinition:taskDefinition,Desired:desiredCount,Running:runningCount,Failed:failedTasks}' \
-                      --output table
+                        wait_for_worker_revision_running() {
+                          LABEL="$1"
+                          SERVICE_NAME="$2"
+                          EXPECTED_REVISION="$3"
+                          OBSERVATION_SECONDS="${4:-15}"
+                          MAX_ATTEMPTS="${5:-36}"
+                          SLEEP_SECONDS="${6:-5}"
+                          MATCHING_TASK_ARNS=""
 
-                    aws ecs describe-services \
-                      --region "${AWS_REGION}" \
-                      --cluster "${ECS_CLUSTER_NAME}" \
-                      --services "${PAID_ECS_SERVICE_NAME}" \
-                      --query 'services[0].events[0:10].[createdAt,message]' \
-                      --output table
+                          attempt=1
+                          while [ "${attempt}" -le "${MAX_ATTEMPTS}" ]; do
+                            SERVICE_JSON="$(aws ecs describe-services \
+                              --region "${AWS_REGION}" \
+                              --cluster "${ECS_CLUSTER_NAME}" \
+                              --services "${SERVICE_NAME}" \
+                              --query 'services[0].{TaskDefinition:taskDefinition,Desired:desiredCount,Running:runningCount,Pending:pendingCount}' \
+                              --output json)"
+                            CURRENT_REVISION="$(printf '%s' "${SERVICE_JSON}" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("TaskDefinition", ""))')"
+                            DESIRED_COUNT="$(printf '%s' "${SERVICE_JSON}" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("Desired", 0))')"
+                            RUNNING_COUNT="$(printf '%s' "${SERVICE_JSON}" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("Running", 0))')"
+                            PENDING_COUNT="$(printf '%s' "${SERVICE_JSON}" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("Pending", 0))')"
 
-                    FINAL_PAID_TASK_DEFINITION_ARN="$(aws ecs describe-services \
-                      --region "${AWS_REGION}" \
-                      --cluster "${ECS_CLUSTER_NAME}" \
-                      --services "${PAID_ECS_SERVICE_NAME}" \
-                      --query 'services[0].taskDefinition' \
-                      --output text)"
+                            if ! printf '%s' "${DESIRED_COUNT}" | grep -Eq '^[0-9]+$'; then
+                              echo "[${LABEL}] invalid desired count: ${DESIRED_COUNT}"
+                              exit 1
+                            fi
+                            if [ "${DESIRED_COUNT}" -lt 1 ]; then
+                              echo "[${LABEL}] desired count is 0. Worker RUNNING verification requires at least one task."
+                              exit 1
+                            fi
 
-                    echo "Requested Paid Worker task definition: ${PAID_TASK_DEFINITION_ARN}"
-                    echo "Final Paid Worker task definition: ${FINAL_PAID_TASK_DEFINITION_ARN}"
+                            TASK_ARNS="$(aws ecs list-tasks \
+                              --region "${AWS_REGION}" \
+                              --cluster "${ECS_CLUSTER_NAME}" \
+                              --service-name "${SERVICE_NAME}" \
+                              --desired-status RUNNING \
+                              --query 'taskArns' \
+                              --output text)"
+                            MATCHING_TASK_ARNS=""
+                            MATCHING_COUNT="0"
+                            if [ -n "${TASK_ARNS}" ] && [ "${TASK_ARNS}" != "None" ]; then
+                              MATCHING_TASK_ARNS="$(aws ecs describe-tasks \
+                                --region "${AWS_REGION}" \
+                                --cluster "${ECS_CLUSTER_NAME}" \
+                                --tasks ${TASK_ARNS} \
+                                --query "tasks[?taskDefinitionArn=='${EXPECTED_REVISION}'].taskArn" \
+                                --output text)"
+                              if [ -n "${MATCHING_TASK_ARNS}" ] && [ "${MATCHING_TASK_ARNS}" != "None" ]; then
+                                MATCHING_COUNT="$(printf '%s\n' ${MATCHING_TASK_ARNS} | wc -w | tr -d ' ')"
+                              fi
+                            fi
 
-                    if [ "${WAIT_EXIT}" -ne 0 ]; then
-                      echo "Paid Worker did not reach stable state."
-                      exit "${WAIT_EXIT}"
-                    fi
+                            echo "[${LABEL}] poll ${attempt}/${MAX_ATTEMPTS}: serviceRevision=${CURRENT_REVISION}, desired=${DESIRED_COUNT}, running=${RUNNING_COUNT}, pending=${PENDING_COUNT}, matchingRevisionTasks=${MATCHING_COUNT}"
 
-                    if [ "${FINAL_PAID_TASK_DEFINITION_ARN}" != "${PAID_TASK_DEFINITION_ARN}" ]; then
-                      echo "Requested Paid Worker revision is not active. ECS Circuit Breaker rollback or another service update occurred."
-                      aws ecs describe-services \
-                        --region "${AWS_REGION}" \
-                        --cluster "${ECS_CLUSTER_NAME}" \
-                        --services "${FREE_ECS_SERVICE_NAME}" "${PAID_ECS_SERVICE_NAME}" \
-                        --query 'services[].{Service:serviceName,TaskDefinition:taskDefinition,Desired:desiredCount,Running:runningCount}' \
-                        --output table
-                      echo "Free Worker may already use the new image while Paid Worker was rolled back. Review both services before the next deployment."
-                      exit 1
-                    fi
+                            if [ "${CURRENT_REVISION}" = "${EXPECTED_REVISION}" ] && [ "${MATCHING_COUNT}" -ge "${DESIRED_COUNT}" ]; then
+                              echo "[${LABEL}] requested revision has ${MATCHING_COUNT}/${DESIRED_COUNT} RUNNING task(s)."
+                              echo "[${LABEL}] observing RUNNING tasks for ${OBSERVATION_SECONDS}s."
+                              sleep "${OBSERVATION_SECONDS}"
 
-                    echo "Paid Worker service is stable: ${PAID_ECS_SERVICE_NAME}"
-                '''
-            }
-        }
+                              FINAL_REVISION="$(aws ecs describe-services \
+                                --region "${AWS_REGION}" \
+                                --cluster "${ECS_CLUSTER_NAME}" \
+                                --services "${SERVICE_NAME}" \
+                                --query 'services[0].taskDefinition' \
+                                --output text)"
+                              if [ "${FINAL_REVISION}" != "${EXPECTED_REVISION}" ]; then
+                                echo "[${LABEL}] service revision changed during observation: ${FINAL_REVISION}"
+                                exit 1
+                              fi
 
-        // Paid Worker가 예상 Revision으로 실행되고 관찰 시간 동안 RUNNING 상태를 유지하는지 확인합니다.
-        stage('Paid Worker Post-Deploy Verification') {
-            options {
-                // 이 검증은 배포 안정성을 확인하며 실제 SQS 메시지 처리 성공까지 검증하지는 않습니다.
-                timeout(time: 5, unit: 'MINUTES')
-            }
-            steps {
-                script {
+                              NON_RUNNING_TASKS="$(aws ecs describe-tasks \
+                                --region "${AWS_REGION}" \
+                                --cluster "${ECS_CLUSTER_NAME}" \
+                                --tasks ${MATCHING_TASK_ARNS} \
+                                --query "tasks[?lastStatus!='RUNNING'].taskArn" \
+                                --output text)"
+                              if [ -n "${NON_RUNNING_TASKS}" ] && [ "${NON_RUNNING_TASKS}" != "None" ]; then
+                                echo "[${LABEL}] requested revision tasks did not remain RUNNING: ${NON_RUNNING_TASKS}"
+                                exit 1
+                              fi
+
+                              echo "[${LABEL}] targeted stable check passed."
+                              return 0
+                            fi
+
+                            attempt=$((attempt + 1))
+                            sleep "${SLEEP_SECONDS}"
+                          done
+
+                          echo "[${LABEL}] targeted stable check timed out."
+                          aws ecs describe-services \
+                            --region "${AWS_REGION}" \
+                            --cluster "${ECS_CLUSTER_NAME}" \
+                            --services "${SERVICE_NAME}" \
+                            --query 'services[0].deployments[].{Status:status,RolloutState:rolloutState,TaskDefinition:taskDefinition,Desired:desiredCount,Running:runningCount,Failed:failedTasks}' \
+                            --output table || true
+                          aws ecs describe-services \
+                            --region "${AWS_REGION}" \
+                            --cluster "${ECS_CLUSTER_NAME}" \
+                            --services "${SERVICE_NAME}" \
+                            --query 'services[0].events[0:10].[createdAt,message]' \
+                            --output table || true
+                          exit 1
+                        }
+
+                        wait_for_worker_revision_running "Paid" "${PAID_ECS_SERVICE_NAME}" "${PAID_TASK_DEFINITION_ARN}" 15
+                    '''
+
                     env.DEPLOY_PHASE = 'PAID_POST_DEPLOY_VERIFICATION_FAILED'
-                }
-                sh '''
-                    set -eu
+                    echo '[Paid] Revision Verification'
+                    sh '''
+                        set -eu
+                        FINAL_PAID_TASK_DEFINITION_ARN="$(aws ecs describe-services \
+                          --region "${AWS_REGION}" \
+                          --cluster "${ECS_CLUSTER_NAME}" \
+                          --services "${PAID_ECS_SERVICE_NAME}" \
+                          --query 'services[0].taskDefinition' \
+                          --output text)"
+                        echo "Requested Paid Worker task definition: ${PAID_TASK_DEFINITION_ARN}"
+                        echo "Final Paid Worker task definition: ${FINAL_PAID_TASK_DEFINITION_ARN}"
+                        if [ "${FINAL_PAID_TASK_DEFINITION_ARN}" != "${PAID_TASK_DEFINITION_ARN}" ]; then
+                          echo "Paid Worker service revision changed before post-deploy verification completed."
+                          exit 1
+                        fi
+                        if [ "${ROLLBACK_TEST_MODE:-NONE}" = "PAID_VERIFY_FAIL" ]; then
+                          echo "Intentional Paid Worker verification failure for rollback test."
+                          exit 1
+                        fi
+                        STOPPED_TASK_ARNS="$(aws ecs list-tasks \
+                          --region "${AWS_REGION}" \
+                          --cluster "${ECS_CLUSTER_NAME}" \
+                          --service-name "${PAID_ECS_SERVICE_NAME}" \
+                          --desired-status STOPPED \
+                          --max-results 5 \
+                          --query 'taskArns' \
+                          --output text)"
+                        if [ -n "${STOPPED_TASK_ARNS}" ] && [ "${STOPPED_TASK_ARNS}" != "None" ]; then
+                          aws ecs describe-tasks \
+                            --region "${AWS_REGION}" \
+                            --cluster "${ECS_CLUSTER_NAME}" \
+                            --tasks ${STOPPED_TASK_ARNS} \
+                            --query 'tasks[].[taskArn,stopCode,stoppedReason]' \
+                            --output table || true
+                        fi
+                        echo "[Paid] Verification Passed for ${PAID_TASK_DEFINITION_ARN}"
+                    '''
 
-                    FINAL_PAID_TASK_DEFINITION_ARN="$(aws ecs describe-services \
-                      --region "${AWS_REGION}" \
-                      --cluster "${ECS_CLUSTER_NAME}" \
-                      --services "${PAID_ECS_SERVICE_NAME}" \
-                      --query 'services[0].taskDefinition' \
-                      --output text)"
-
-                    if [ "${FINAL_PAID_TASK_DEFINITION_ARN}" != "${PAID_TASK_DEFINITION_ARN}" ]; then
-                      echo "Paid Worker service revision changed before post-deploy verification completed."
-                      echo "Requested task definition: ${PAID_TASK_DEFINITION_ARN}"
-                      echo "Final service task definition: ${FINAL_PAID_TASK_DEFINITION_ARN}"
-                      exit 1
-                    fi
-
-                    if [ "${ROLLBACK_TEST_MODE:-NONE}" = "PAID_VERIFY_FAIL" ]; then
-                      echo "Intentional Paid Worker verification failure for rollback test."
-                      exit 1
-                    fi
-
-                    PAID_RUNNING_TASK_ARNS="$(aws ecs list-tasks \
-                      --region "${AWS_REGION}" \
-                      --cluster "${ECS_CLUSTER_NAME}" \
-                      --service-name "${PAID_ECS_SERVICE_NAME}" \
-                      --desired-status RUNNING \
-                      --query 'taskArns' \
-                      --output text)"
-
-                    if [ -z "${PAID_RUNNING_TASK_ARNS}" ] || [ "${PAID_RUNNING_TASK_ARNS}" = "None" ]; then
-                      echo "No RUNNING Paid Worker tasks found."
-                      exit 1
-                    fi
-
-                    UNEXPECTED_TASKS="$(aws ecs describe-tasks \
-                      --region "${AWS_REGION}" \
-                      --cluster "${ECS_CLUSTER_NAME}" \
-                      --tasks ${PAID_RUNNING_TASK_ARNS} \
-                      --query "tasks[?taskDefinitionArn!='${PAID_TASK_DEFINITION_ARN}'].taskArn" \
-                      --output text)"
-
-                    if [ -n "${UNEXPECTED_TASKS}" ] && [ "${UNEXPECTED_TASKS}" != "None" ]; then
-                      echo "Paid Worker tasks use an unexpected task definition: ${UNEXPECTED_TASKS}"
-                      exit 1
-                    fi
-
-                    sleep 30
-
-                    # 짧은 Crash Loop를 감지하기 위해 관찰 시간 후 동일 Task ARN 상태를 다시 확인합니다.
-                    NON_RUNNING_TASKS="$(aws ecs describe-tasks \
-                      --region "${AWS_REGION}" \
-                      --cluster "${ECS_CLUSTER_NAME}" \
-                      --tasks ${PAID_RUNNING_TASK_ARNS} \
-                      --query "tasks[?lastStatus!='RUNNING'].taskArn" \
-                      --output text)"
-
-                    if [ -n "${NON_RUNNING_TASKS}" ] && [ "${NON_RUNNING_TASKS}" != "None" ]; then
-                      echo "Paid Worker tasks did not remain RUNNING: ${NON_RUNNING_TASKS}"
-                      exit 1
-                    fi
-
-                    STOPPED_TASK_ARNS="$(aws ecs list-tasks \
-                      --region "${AWS_REGION}" \
-                      --cluster "${ECS_CLUSTER_NAME}" \
-                      --service-name "${PAID_ECS_SERVICE_NAME}" \
-                      --desired-status STOPPED \
-                      --max-results 5 \
-                      --query 'taskArns' \
-                      --output text)"
-
-                    if [ -n "${STOPPED_TASK_ARNS}" ] && [ "${STOPPED_TASK_ARNS}" != "None" ]; then
-                      # 정상 Rolling Update도 이전 Task를 중지하므로 중지 Task 정보는 참고용으로 출력합니다.
-                      aws ecs describe-tasks \
-                        --region "${AWS_REGION}" \
-                        --cluster "${ECS_CLUSTER_NAME}" \
-                        --tasks ${STOPPED_TASK_ARNS} \
-                        --query 'tasks[].[taskArn,stopCode,stoppedReason]' \
-                        --output table || true
-                    fi
-
-                    echo "Paid Worker post-deploy verification passed for ${PAID_TASK_DEFINITION_ARN}"
-                '''
-                script {
                     env.DEPLOY_PHASE = 'DEPLOY_SUCCESS'
+                    echo 'Worker Deploy & Verify completed.'
                 }
             }
         }
@@ -1751,7 +1731,7 @@ PY
                                 echo "Rollback verification failed: RUNNING tasks use an unexpected revision: ${UNEXPECTED_TASKS}"
                                 return 1
                               fi
-                              sleep 30
+                              sleep 15
                               NON_RUNNING_TASKS="$(aws ecs describe-tasks \
                                 --region "${AWS_REGION}" \
                                 --cluster "${ECS_CLUSTER_NAME}" \
