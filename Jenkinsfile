@@ -1231,8 +1231,8 @@ PY
 
                             echo "[${LABEL}] poll ${attempt}/${MAX_ATTEMPTS}: serviceRevision=${CURRENT_REVISION}, desired=${DESIRED_COUNT}, running=${RUNNING_COUNT}, pending=${PENDING_COUNT}, matchingRevisionTasks=${MATCHING_COUNT}"
 
-                            if [ "${CURRENT_REVISION}" = "${EXPECTED_REVISION}" ] && [ "${MATCHING_COUNT}" -ge "${DESIRED_COUNT}" ]; then
-                              echo "[${LABEL}] requested revision has ${MATCHING_COUNT}/${DESIRED_COUNT} RUNNING task(s)."
+                            if [ "${CURRENT_REVISION}" = "${EXPECTED_REVISION}" ] && [ "${MATCHING_COUNT}" -ge "${DESIRED_COUNT}" ] && [ "${PENDING_COUNT}" -eq 0 ]; then
+                              echo "[${LABEL}] requested revision has ${MATCHING_COUNT}/${DESIRED_COUNT} RUNNING task(s), and pending count is 0."
                               echo "[${LABEL}] observing RUNNING tasks for ${OBSERVATION_SECONDS}s."
                               sleep "${OBSERVATION_SECONDS}"
 
@@ -1471,8 +1471,8 @@ PY
 
                             echo "[${LABEL}] poll ${attempt}/${MAX_ATTEMPTS}: serviceRevision=${CURRENT_REVISION}, desired=${DESIRED_COUNT}, running=${RUNNING_COUNT}, pending=${PENDING_COUNT}, matchingRevisionTasks=${MATCHING_COUNT}"
 
-                            if [ "${CURRENT_REVISION}" = "${EXPECTED_REVISION}" ] && [ "${MATCHING_COUNT}" -ge "${DESIRED_COUNT}" ]; then
-                              echo "[${LABEL}] requested revision has ${MATCHING_COUNT}/${DESIRED_COUNT} RUNNING task(s)."
+                            if [ "${CURRENT_REVISION}" = "${EXPECTED_REVISION}" ] && [ "${MATCHING_COUNT}" -ge "${DESIRED_COUNT}" ] && [ "${PENDING_COUNT}" -eq 0 ]; then
+                              echo "[${LABEL}] requested revision has ${MATCHING_COUNT}/${DESIRED_COUNT} RUNNING task(s), and pending count is 0."
                               echo "[${LABEL}] observing RUNNING tasks for ${OBSERVATION_SECONDS}s."
                               sleep "${OBSERVATION_SECONDS}"
 
