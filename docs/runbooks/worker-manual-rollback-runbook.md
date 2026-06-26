@@ -340,21 +340,8 @@ aws ecs describe-services `
 - Jenkins Pipeline과의 충돌 여부
 - 담당자 승인 필요 여부
 
-## 27. 최소 캡처 목록
 
-```text
-00-worker-before-rollback-current-state.png
-01-worker-revision-list.png
-02-worker-revision-image-check.png
-03-worker-ecr-image-exists.png
-04-free-worker-rollback-success.png
-05-free-worker-restore-success.png
-06-paid-worker-rollback-success.png
-07-paid-worker-restore-success.png
-08-worker-final-state.png
-```
-
-## 28. 검증 체크리스트
+## 27. 검증 체크리스트
 
 - [ ] Free/Paid 현재 Revision 기록
 - [ ] Free/Paid 이전 정상 Revision 후보 조회
@@ -369,24 +356,3 @@ aws ecs describe-services `
 - [ ] Paid 30초 RUNNING 유지 확인
 - [ ] Paid 최신 정상 Revision으로 복구
 - [ ] 최종 Free/Paid 상태 확인
-
-## 29. 이번 검증 예시
-
-아래 값은 이번 검증 예시이다. 실제 장애 대응 시에는 반드시 Free/Paid 현재 Revision과 이전 정상 Revision을 다시 조회해야 한다.
-
-Worker는 특히 바로 이전 Revision 번호가 롤백 대상이라고 가정하면 안 된다. Free/Paid가 동일한 Worker image를 사용하는 Revision 조합인지 반드시 확인해야 한다.
-
-| 구분 | Task Definition Revision | 이미지 태그 |
-|---|---|---|
-| Free 현재 Revision | `securevoice-dev-free-worker:23` | `<이번 검증에서 확인한 현재 이미지 태그>` |
-| Paid 현재 Revision | `securevoice-dev-paid-worker:23` | `<이번 검증에서 확인한 현재 이미지 태그>` |
-| Free 롤백 대상 Revision | `securevoice-dev-free-worker:22` | `build-11-a70a114` |
-| Paid 롤백 대상 Revision | `securevoice-dev-paid-worker:22` | `build-11-a70a114` |
-
-## 30. 발표용 요약 문장
-
-Worker 수동 rollback은 Free/Paid ECS Service의 Task Definition을 이전 정상 Revision 조합으로 순차 전환하고, 각 Service가 stable 상태에 도달한 뒤 RUNNING task와 revision을 확인하는 절차이다. 검증 완료 후에는 Free/Paid를 다시 최신 정상 Revision으로 복구해 release 일관성을 유지한다.
-
-## 31. 한 줄 결론
-
-Worker 수동 rollback은 특정 revision 번호를 고정하지 않고, Free/Paid가 동일 Worker image를 사용하는 이전 정상 Revision 조합을 확인한 뒤 순차적으로 전환하고 RUNNING 상태를 검증하는 절차이다.
