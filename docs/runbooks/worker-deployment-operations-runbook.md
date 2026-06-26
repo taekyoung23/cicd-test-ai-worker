@@ -941,9 +941,3 @@ Paid 실패 시 Free 보상 rollback은 Free 자체 장애 때문이 아니다. 
 - SQS→Worker→S3→RDS E2E 검증은 별도 수동 Runbook 또는 후속 고도화 대상이다.
 - DLQ 메시지 임의 삭제 금지
 - 메시지 본문/오디오 파일 경로/request_id 캡처 시 마스킹
-
-## 10. Worker 보고서/발표용 요약
-
-Worker CI/CD는 하나의 공통 Worker image를 Free/Paid ECS Service에 순차 배포하는 구조이다. Jenkins는 Free Worker 검증 성공 후 Paid Worker를 배포하며, Free 실패 시 Paid 배포를 시작하지 않고 Free만 baseline으로 복구한다. Paid 실패 시에는 Paid rollback과 함께 이미 새 revision으로 올라간 Free Worker도 baseline으로 보상 rollback하여 Free/Paid release 일관성을 유지한다.
-
-Worker 검증은 ALB나 `/api/health`가 아니라 ECS task RUNNING 상태와 task definition revision 일치 여부를 중심으로 수행한다. 운영 장애 분석은 SQS/DLQ/CloudWatch Logs/stopped reason을 중심으로 진행하며, Trivy는 Warning Mode로 보안 스캔 증적을 확보한다. SQS→Worker→S3→RDS E2E inference 검증은 후속 고도화 또는 별도 수동 Runbook 대상으로 분리한다.
