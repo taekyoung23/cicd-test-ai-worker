@@ -2,32 +2,28 @@
 
 ## 1. 문서 개요
 
-이 문서는 `ai-worker-cicd` Jenkins Pipeline 실패 시 운영자가 Free/Paid Worker 배포 장애를 빠르게 분리하고 복구하기 위한 운영 Runbook이다.
-
-적용 범위:
+이 문서는 AI Worker 배포 실패 또는 Worker 장애 발생 시 Free/Paid Worker, SQS, DLQ, CloudWatch Logs 중심으로 원인을 판단하기 위한 장애 판단용 Runbook이다.
 
 - 대상 Jenkins Job: `ai-worker-cicd`
-- 대상 ECS Service: Free Worker Service, Paid Worker Service
+- 대상 ECS Service: `securevoice-dev-free-worker-service`, `securevoice-dev-paid-worker-service`
 - 대상 Queue: Free Worker Queue, Paid Worker Queue
 - 대상 DLQ: Free Worker DLQ, Paid Worker DLQ
 - 주요 점검 대상: Jenkins, ECR Image/Digest, ECS Free/Paid Worker Service, ECS Task Definition Revision, SQS Free/Paid Queue, SQS Free/Paid DLQ, CloudWatch Logs, Worker stopped reason, Deployment Summary Artifact, Slack 알림
 
-이 Runbook이 다루는 장애 범위:
+다루는 범위:
 
-- Jenkins 실행 및 GitHub Webhook 장애
-- Worker build/test 실패
-- Docker image build 및 smoke test 실패
-- Trivy scan 결과 확인
-- ECR login/push 실패
-- Free/Paid baseline capture 실패
-- Free/Paid deploy/verify 실패
-- Free/Paid rollback 및 Free compensating rollback 실패
-- Worker task RUNNING 실패
-- SQS Queue 적체 및 DLQ 유입
-- CloudWatch Logs의 inference/runtime 오류
-- Slack 알림 및 Deployment Summary artifact 누락
+- Jenkins 실패 stage 확인
+- Free/Paid 배포 단계 확인
+- Free 실패 시 Paid 미배포 여부 확인
+- Paid 실패 시 Free 보상 rollback 여부 확인
+- ECS Free/Paid Service 상태 확인
+- Worker RUNNING task 확인
+- SQS Queue 적체 확인
+- DLQ 유입 확인
+- CloudWatch Logs 확인
+- Rollback 필요 여부 판단
 
-이 Runbook이 다루지 않는 범위:
+다루지 않는 범위:
 
 - API ALB Target Health 장애
 - `/api/health` 장애
@@ -35,30 +31,7 @@
 - RDS schema 변경
 - Terraform apply 장애
 
-Worker는 ALB로 외부 요청을 받는 서비스가 아니라 SQS 메시지를 처리하는 비동기 ECS Fargate Worker이다.
-
 ## 2. Worker 배포 아키텍처 및 배포 흐름
-
-배포 흐름:
-
-```text
-GitHub push
-→ Jenkins Worker Pipeline
-→ Source Checkout
-→ Worker Build & Test
-→ Docker Image Build
-→ Docker Image Smoke Test
-→ Trivy Image Scan - Warning Mode
-→ ECR Push
-→ Free Worker baseline capture
-→ Paid Worker baseline capture
-→ Free Worker deploy/verify
-→ Paid Worker deploy/verify
-→ Rollback or Compensation Rollback if needed
-→ Slack Notification
-```
-
-운영 관점의 흐름:
 
 ```text
 GitHub
@@ -87,12 +60,10 @@ Free Worker와 Paid Worker는 별도 ECS Service, 별도 SQS Queue, 별도 DLQ�
 
 ## 3. 정상 배포 기준
 
-아래 조건을 모두 만족하면 Worker 배포가 정상 완료된 것으로 판단한다.
-
 - Jenkins build result가 `SUCCESS`
 - Worker build/test 통과
 - Docker image smoke test 통과
-- Trivy scan이 `WARNING` mode로 실행됨
+- Trivy scan Warning Mode 실행
 - ECR push 성공
 - Image digest 확인
 - Free Worker baseline revision 저장
@@ -136,11 +107,11 @@ Free Worker와 Paid Worker는 별도 ECS Service, 별도 SQS Queue, 별도 DLQ�
 
 - executor 부족이면 대기 후 재시도
 - Jenkins 자체 장애면 Jenkins 운영 담당자에게 에스컬레이션
-- Terraform apply로 즉시 해결하려 하지 않는다.
+- Terraform apply로 즉시 해결하지 않음
 
 #### 재시도 기준
 
-- Jenkins UI와 executor가 정상
+- Jenkins UI와 executor 정상
 - `ai-worker-cicd` 수동 실행 가능
 
 ### 4.2 GitHub Webhook이 Jenkins를 트리거하지 못함
@@ -297,7 +268,7 @@ Free Worker와 Paid Worker는 별도 ECS Service, 별도 SQS Queue, 별도 DLQ�
 
 #### 재시도 기준
 
-- 컨테이너가 정상 기동되고 healthcheck/import 검증 통과
+- 컨테이너 정상 기동 및 healthcheck/import 검증 통과
 
 ### 4.7 Trivy Scan 실패 또는 finding 존재
 
@@ -322,7 +293,7 @@ Free Worker와 Paid Worker는 별도 ECS Service, 별도 SQS Queue, 별도 DLQ�
 
 - Trivy 실행 실패면 도구/네트워크 상태 확인 후 재시도
 - finding은 별도 보안 조치 항목으로 관리
-- 현재는 finding 자체를 배포 차단 또는 rollback 원인으로 보지 않음
+- 현재 finding 자체는 배포 차단 또는 rollback 원인이 아님
 
 #### 재시도 기준
 
@@ -448,6 +419,7 @@ Free Worker와 Paid Worker는 별도 ECS Service, 별도 SQS Queue, 별도 DLQ�
 - Free rollback result 확인
 - Paid가 미배포 상태인지 확인
 - stopped reason과 CloudWatch Logs 기반 원인 수정
+- 수동 복구가 필요하면 `Worker 수동 Rollback Runbook`으로 이동
 
 #### 재시도 기준
 
@@ -484,6 +456,7 @@ Free Worker와 Paid Worker는 별도 ECS Service, 별도 SQS Queue, 별도 DLQ�
 - Paid rollback result 확인
 - Free compensating rollback result 확인
 - Free/Paid final revision이 baseline인지 확인
+- 수동 복구가 필요하면 `Worker 수동 Rollback Runbook`으로 이동
 
 #### 재시도 기준
 
@@ -511,12 +484,11 @@ Free Worker와 Paid Worker는 별도 ECS Service, 별도 SQS Queue, 별도 DLQ�
 
 #### 조치 방법
 
-- 마지막 정상 Free task definition으로 ECS Service 수동 update
-- service stable 확인
+- `Worker 수동 Rollback Runbook`에 따라 Free Service를 정상 revision으로 복구
 
 #### 재시도 기준
 
-- Free final revision이 baseline으로 복구
+- Free final revision이 정상 revision으로 복구
 
 ### 4.14 Paid rollback 실패
 
@@ -539,12 +511,11 @@ Free Worker와 Paid Worker는 별도 ECS Service, 별도 SQS Queue, 별도 DLQ�
 
 #### 조치 방법
 
-- 마지막 정상 Paid task definition으로 ECS Service 수동 update
-- service stable 확인
+- `Worker 수동 Rollback Runbook`에 따라 Paid Service를 정상 revision으로 복구
 
 #### 재시도 기준
 
-- Paid final revision이 baseline으로 복구
+- Paid final revision이 정상 revision으로 복구
 
 ### 4.15 Free compensating rollback 실패
 
@@ -567,8 +538,7 @@ Free Worker와 Paid Worker는 별도 ECS Service, 별도 SQS Queue, 별도 DLQ�
 
 #### 조치 방법
 
-- Free를 baseline revision으로 수동 update
-- Free/Paid final revision이 모두 baseline인지 확인
+- `Worker 수동 Rollback Runbook`에 따라 Free/Paid 정상 revision 조합으로 수동 복구
 
 #### 재시도 기준
 
@@ -599,7 +569,7 @@ Free Worker와 Paid Worker는 별도 ECS Service, 별도 SQS Queue, 별도 DLQ�
 #### 조치 방법
 
 - stopped reason 기준으로 dependency/env/resource 문제 해결
-- 필요 시 baseline revision으로 수동 복구
+- 필요 시 정상 revision으로 수동 복구
 
 #### 재시도 기준
 
@@ -635,13 +605,13 @@ Free Worker와 Paid Worker는 별도 ECS Service, 별도 SQS Queue, 별도 DLQ�
 
 - Worker RUNNING 상태 확인
 - CloudWatch Logs에서 처리 오류 확인
-- 필요 시 Worker scale 조정은 담당자 승인 후 진행
+- scale 조정이나 재처리는 담당자 승인 후 수행
 
 #### 재시도 기준
 
-- MessagesDeleted가 증가
-- OldestMessageAge가 감소
-- Queue visible message가 안정화
+- MessagesDeleted 증가
+- OldestMessageAge 감소
+- Queue visible message 안정화
 
 ### 4.18 DLQ 유입
 
@@ -677,7 +647,7 @@ Free Worker와 Paid Worker는 별도 ECS Service, 별도 SQS Queue, 별도 DLQ�
 
 - 원인 수정 완료
 - 재처리 승인 완료
-- DLQ 신규 유입이 멈춤
+- DLQ 신규 유입 중단
 
 ### 4.19 CloudWatch Logs에서 inference/runtime 오류
 
@@ -699,7 +669,7 @@ Free Worker와 Paid Worker는 별도 ECS Service, 별도 SQS Queue, 별도 DLQ�
 
 - Worker CloudWatch Logs 확인
 - request_id 기준 로그 추적
-- stopped task reason과 함께 대조
+- stopped task reason과 대조
 
 #### 조치 방법
 
@@ -765,26 +735,20 @@ Free Worker와 Paid Worker는 별도 ECS Service, 별도 SQS Queue, 별도 DLQ�
 
 #### 재시도 기준
 
-- Deployment Summary Artifact가 생성되고 archive됨
+- Deployment Summary Artifact 생성 및 archive 완료
 
 ## 5. Worker Stage별 상세 장애 대응
 
 ### Worker Build & Test
-
-확인 항목:
 
 - Python dependency 설치 실패
 - fairseq 관련 설치 문제
 - import 실패
 - pytest 실패
 - 모델 파일을 이미지에 포함하지 않는 구조인지
-- 테스트 실패가 배포 차단 사유인지
-
-테스트 실패는 배포 차단 사유로 본다.
+- 테스트 실패가 배포 차단 사유인지 확인
 
 ### Docker Image Build
-
-확인 항목:
 
 - CPU 기반 PyTorch 설치
 - Dockerfile base image
@@ -794,11 +758,7 @@ Free Worker와 Paid Worker는 별도 ECS Service, 별도 SQS Queue, 별도 DLQ�
 - Docker daemon/socket 문제
 - 이미지 크기 증가 문제
 
-모델 파일은 image에 직접 포함하지 않고 runtime에서 사용하는 구조를 유지한다.
-
 ### Docker Image Smoke Test
-
-확인 항목:
 
 - 컨테이너 기동 여부
 - Worker process 기본 import 가능 여부
@@ -808,25 +768,20 @@ Free Worker와 Paid Worker는 별도 ECS Service, 별도 SQS Queue, 별도 DLQ�
 
 ### Trivy Image Scan
 
-현재 Trivy는 `WARNING` 모드이다.
-
+- 현재 Trivy는 `WARNING` 모드이다.
 - `HIGH/CRITICAL` finding이 있어도 현재는 배포 차단 Gate가 아니다.
 - `Trivy Gate=NOT_APPLIED`
 - finding은 별도 보안 조치 항목으로 관리한다.
 
 ### ECR Push
 
-확인 항목:
-
 - ECR login
 - repository name
 - image tag
 - image digest
-- common worker image가 Free/Paid 모두에 사용되는지
+- common worker image가 Free/Paid 모두에 사용되는지 확인
 
 ### Free Worker Deploy/Verify
-
-확인 항목:
 
 - Free baseline revision
 - Free new revision
@@ -834,11 +789,9 @@ Free Worker와 Paid Worker는 별도 ECS Service, 별도 SQS Queue, 별도 DLQ�
 - Free running task revision
 - Free stopped reason
 - Free CloudWatch Logs
-- Free 실패 시 Paid 배포가 시작되지 않는지
+- Free 실패 시 Paid 배포가 시작되지 않는지 확인
 
 ### Paid Worker Deploy/Verify
-
-확인 항목:
 
 - Paid baseline revision
 - Paid new revision
@@ -846,11 +799,9 @@ Free Worker와 Paid Worker는 별도 ECS Service, 별도 SQS Queue, 별도 DLQ�
 - Paid running task revision
 - Paid stopped reason
 - Paid CloudWatch Logs
-- Paid 실패 시 Paid rollback과 Free compensating rollback이 수행되는지
+- Paid 실패 시 Paid rollback과 Free compensating rollback이 수행되는지 확인
 
-### Rollback / Compensation Rollback
-
-확인 항목:
+### Rollback 필요 여부 판단
 
 - Free rollback result
 - Paid rollback result
@@ -860,15 +811,19 @@ Free Worker와 Paid Worker는 별도 ECS Service, 별도 SQS Queue, 별도 DLQ�
 - Rollback Result
 - Recovery Verified 여부
 
+수동 복구가 필요한 경우 아래 절차형 Runbook을 따른다.
+
+- Worker 수동 Rollback Runbook: `docs/runbooks/worker-manual-rollback-runbook.md`
+
 ## 6. SQS / DLQ 상세 장애 대응
 
 ### SQS Queue 적체
 
 #### 증상
 
-- Free/Paid Queue에 처리 대기 메시지가 증가한다.
-- 처리 지연이 길어진다.
-- Oldest message age가 증가한다.
+- Free/Paid Queue에 처리 대기 메시지가 증가
+- 처리 지연 증가
+- Oldest message age 증가
 
 #### 주요 원인
 
@@ -897,14 +852,14 @@ Free Worker와 Paid Worker는 별도 ECS Service, 별도 SQS Queue, 별도 DLQ�
 
 - MessagesDeleted 증가
 - OldestMessageAge 감소
-- Queue 적체가 안정화
+- Queue 적체 안정화
 
 ### DLQ 유입
 
 #### 증상
 
-- Free DLQ 또는 Paid DLQ에 신규 메시지가 유입된다.
-- 특정 request_id가 반복 실패한다.
+- Free DLQ 또는 Paid DLQ에 신규 메시지 유입
+- 특정 request_id 반복 실패
 
 #### 주요 원인
 
@@ -941,7 +896,7 @@ Free Worker와 Paid Worker는 별도 ECS Service, 별도 SQS Queue, 별도 DLQ�
 - 메시지 본문에 민감한 데이터가 있을 수 있으므로 캡처 시 마스킹한다.
 - DLQ 메시지 삭제/재처리는 임의로 하지 않는다.
 
-## 7. Worker 수동 복구 절차
+## 7. Worker 수동 복구 판단 절차
 
 1. Slack 실패 알림에서 Jenkins Build URL 확인
 2. Failed Scenario 확인
@@ -954,7 +909,7 @@ Free Worker와 Paid Worker는 별도 ECS Service, 별도 SQS Queue, 별도 DLQ�
 9. SQS Queue 적체 확인
 10. DLQ 유입 확인
 11. Rollback Result 확인
-12. 필요 시 baseline revision으로 ECS Service 수동 업데이트
+12. 수동 복구가 필요하면 `Worker 수동 Rollback Runbook`으로 이동
 13. SQS/DLQ 장애는 메시지 재처리 전 담당자 승인
 
 주의:
@@ -963,25 +918,13 @@ Free Worker와 Paid Worker는 별도 ECS Service, 별도 SQS Queue, 별도 DLQ�
 - API 장애와 Worker 장애를 분리해서 판단한다.
 - 즉시 Terraform apply로 해결하지 않는다.
 
-## 8. Worker Rollback 기준
+## 8. Worker Rollback 판단 기준
 
-자동 rollback 및 compensation rollback 기준:
-
-- Free 실패 시 Paid 배포 미진행
-- Free 실패 시 Free baseline rollback
-- Paid 실패 시 Paid baseline rollback
-- Paid 실패 시 Free compensating rollback
-- baseline revision과 final revision 비교
-- rollback 성공 조건은 final revision이 baseline과 일치하고 service가 stable인 상태
-
-rollback 실패 시:
-
-1. Free/Paid baseline revision 확인
-2. 실패 service를 baseline task definition으로 수동 update
-3. service stable 대기
-4. RUNNING task revision 확인
-5. rollback 성공 후 실패 revision 원인 분석
-6. SQS 적체/DLQ 여부 후속 확인
+- Free 실패 시 Paid 배포 미진행이 기대 동작이다.
+- Free 실패 시 Free baseline rollback이 필요할 수 있다.
+- Paid 실패 시 Paid baseline rollback이 필요할 수 있다.
+- Paid 실패 시 Free compensating rollback이 필요할 수 있다.
+- rollback 성공 조건은 final revision이 의도한 정상 revision과 일치하고 service가 stable인 상태이다.
 
 Paid 실패 시 Free 보상 rollback은 Free 자체 장애 때문이 아니다. 동일 Worker image를 Free/Paid에 하나의 release 단위로 배포하기 때문에 partial deployment를 피하고 release 일관성을 유지하기 위한 정책이다.
 
