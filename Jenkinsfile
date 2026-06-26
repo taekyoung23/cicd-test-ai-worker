@@ -2,6 +2,67 @@ def slackDisplay(value) {
     return value == null || value.toString().trim() == '' ? 'N/A' : value.toString()
 }
 
+def slackSection(Map details) {
+    return details.collect { key, value ->
+        "- ${key}: ${slackDisplay(value)}"
+    }.join('\n')
+}
+
+def yesNo(value) {
+    return value == true || value?.toString() == 'true' ? 'Yes' : 'No'
+}
+
+def executedText(value) {
+    return value == true || value?.toString() == 'true' ? '실행됨' : '미실행'
+}
+
+def shortSha(value) {
+    String text = slackDisplay(value)
+    return text == 'N/A' ? text : text.take(7)
+}
+
+def shortImageTag(value) {
+    String text = slackDisplay(value)
+    if (text == 'N/A') {
+        return text
+    }
+    if (text.contains('@')) {
+        return text.substring(text.lastIndexOf('@') + 1).replace('sha256:', 'sha256:').take(19)
+    }
+    int index = text.lastIndexOf(':')
+    return index >= 0 ? text.substring(index + 1) : text
+}
+
+def shortDigest(value) {
+    String text = slackDisplay(value).replace('sha256:', '')
+    return text == 'N/A' ? text : "sha256:${text.take(12)}"
+}
+
+def shortTaskDefinition(value) {
+    String text = slackDisplay(value)
+    if (text == 'N/A') {
+        return text
+    }
+    String marker = 'task-definition/'
+    if (text.contains(marker)) {
+        return text.substring(text.indexOf(marker) + marker.length())
+    }
+    return text.contains('/') ? text.substring(text.lastIndexOf('/') + 1) : text
+}
+
+def workerFailureTitle(String phase, String target) {
+    if ((target ?: '').contains('Paid')) {
+        return ':x: Worker 배포 실패 - Paid Worker 실패'
+    }
+    if ((target ?: '').contains('Free')) {
+        return ':x: Worker 배포 실패 - Free Worker 실패'
+    }
+    if ((phase ?: '').contains('STABILIZATION')) {
+        return ':x: Worker 배포 실패 - ECS 안정화 실패'
+    }
+    return ':x: Worker 배포 실패 - Pipeline 실패'
+}
+
 def workerRunbookLink() {
     return '<https://github.com/taekyoung23/cicd-test-ai-worker/blob/ktk-cicd/docs/runbooks/worker-deployment-runbook.md|운영 가이드>'
 }
@@ -102,12 +163,13 @@ PY
 def trivySlackDetails(String serviceType) {
     Map trivy = readTrivySummary(serviceType)
     return [
-        'Trivy'          : trivy.status,
-        'Trivy HIGH'     : trivy.high_count,
-        'Trivy CRITICAL' : trivy.critical_count,
-        'Trivy Mode'     : 'WARNING',
-        'Trivy Gate'     : 'NOT_APPLIED',
-        'Trivy Report'   : 'Jenkins Artifact 확인'
+        '보안 스캔' : slackSection([
+            Trivy     : 'WARNING',
+            Status    : trivy.status,
+            Findings  : "HIGH ${trivy.high_count} / CRITICAL ${trivy.critical_count}",
+            '배포 차단': 'No',
+            Report    : 'Jenkins Artifact 확인'
+        ])
     ]
 }
 
@@ -277,9 +339,6 @@ def writeAiFailureSummaryArtifact(String serviceType, Map summary) {
 }
 
 def resolveWorkerAiSummaryTarget() {
-    if (env.FREE_UPDATE_REQUESTED == 'true' && env.PAID_UPDATE_REQUESTED == 'true') {
-        return 'Free/Paid Worker'
-    }
     if (env.PAID_UPDATE_REQUESTED == 'true') {
         return 'Paid Worker'
     }
@@ -553,18 +612,20 @@ PY
 
 def sendAiFailureSummarySlack(String title, Map summary, Map details) {
     sendSlackNotification(title, [
-        Service            : details.service ?: 'N/A',
-        Target             : details.target ?: 'N/A',
-        Job                : env.JOB_NAME,
-        Build              : env.BUILD_NUMBER,
-        'Failed Stage'     : details.failed_stage ?: 'N/A',
-        'AI Summary Status': summary.status ?: 'N/A',
-        'Likely Cause'     : summary.likely_cause ?: fallbackWorkerLikelyCause(details.failed_stage ?: 'N/A', details.target ?: 'Unknown'),
-        'Rollback Status'  : summary.rollback_status_text ?:
+        '대상' : slackSection([
+            Service       : details.service ?: 'N/A',
+            Target        : details.target ?: 'N/A',
+            'Failed stage': details.failed_stage ?: 'N/A',
+            Status        : summary.status ?: 'N/A'
+        ]),
+        '요약' : summary.likely_cause ?: fallbackWorkerLikelyCause(details.failed_stage ?: 'N/A', details.target ?: 'Unknown'),
+        '복구 상태' : summary.rollback_status_text ?:
             fallbackWorkerRollbackStatusText(details.rollback_status ?: 'N/A', details.target ?: 'Unknown', details.compensation_rollback ?: 'N/A'),
-        'Next Action'      : summary.next_action ?: fallbackWorkerNextAction(details.rollback_status ?: 'N/A', details.target ?: 'Unknown'),
-        Jenkins            : maskSensitiveText(env.BUILD_URL ?: 'N/A'),
-        Runbook            : workerRunbookLink()
+        '다음 확인' : summary.next_action ?: fallbackWorkerNextAction(details.rollback_status ?: 'N/A', details.target ?: 'Unknown'),
+        '링크' : slackSection([
+            Jenkins: maskSensitiveText(env.BUILD_URL ?: 'N/A'),
+            Runbook: workerRunbookLink()
+        ])
     ])
 }
 
@@ -1598,18 +1659,24 @@ PY
             echo "Worker image build completed: ${env.IMAGE_URI}"
             echo "Deployment result: DEPLOY_SUCCESS"
             script {
-                sendSlackNotification(':white_check_mark: Worker deployment succeeded', [
-                    Result                       : 'SUCCESS',
-                    Job                          : env.JOB_NAME,
-                    Build                        : env.BUILD_NUMBER,
-                    Commit                       : env.GIT_COMMIT_SHA ?: env.GIT_SHORT_SHA,
-                    'Shared Worker Image URI'    : env.IMAGE_URI,
-                    'Shared Worker Image Digest' : env.IMAGE_DIGEST,
-                    'Free Worker Service'        : env.FREE_ECS_SERVICE_NAME,
-                    'Free Task Definition'       : env.FREE_TASK_DEFINITION_ARN,
-                    'Paid Worker Service'        : env.PAID_ECS_SERVICE_NAME,
-                    'Paid Task Definition'       : env.PAID_TASK_DEFINITION_ARN,
-                    'Jenkins Build URL'          : env.BUILD_URL
+                sendSlackNotification(':white_check_mark: Worker 배포 성공', [
+                    '핵심 상태' : slackSection([
+                        Build : "#${env.BUILD_NUMBER}",
+                        Result: 'SUCCESS',
+                        Phase : env.DEPLOY_PHASE ?: 'DEPLOY_SUCCESS'
+                    ]),
+                    '배포 정보' : slackSection([
+                        Image : shortImageTag(env.IMAGE_URI),
+                        Digest: shortDigest(env.IMAGE_DIGEST),
+                        Commit: shortSha(env.GIT_COMMIT_SHA ?: env.GIT_SHORT_SHA)
+                    ]),
+                    'Worker Revision' : slackSection([
+                        Free: shortTaskDefinition(env.FREE_TASK_DEFINITION_ARN),
+                        Paid: shortTaskDefinition(env.PAID_TASK_DEFINITION_ARN)
+                    ]),
+                    '링크' : slackSection([
+                        Jenkins: env.BUILD_URL
+                    ])
                 ] + trivySlackDetails('worker'))
             }
         }
@@ -1621,20 +1688,26 @@ PY
                     (env.FREE_UPDATE_REQUESTED == 'true' ?
                         'FREE_FAILED; FREE_ROLLBACK_REQUIRED; PAID_NOT_DEPLOYED' :
                         'FAILED_BEFORE_WORKER_SERVICE_UPDATE')
-                sendSlackNotification(':x: Worker deployment failed', [
-                    Result                       : 'FAILED',
-                    Job                          : env.JOB_NAME,
-                    Build                        : env.BUILD_NUMBER,
-                    Commit                       : env.GIT_COMMIT_SHA ?: env.GIT_SHORT_SHA,
-                    'Deploy Phase'               : env.DEPLOY_PHASE,
-                    Scenario                     : failureScenario,
-                    'Shared Worker Image URI'    : env.IMAGE_URI,
-                    'Free Worker Service'        : env.FREE_ECS_SERVICE_NAME,
-                    'Paid Worker Service'        : env.PAID_ECS_SERVICE_NAME,
-                    'Free Update Requested'      : env.FREE_UPDATE_REQUESTED,
-                    'Paid Update Requested'      : env.PAID_UPDATE_REQUESTED,
-                    'Jenkins Build URL'          : env.BUILD_URL,
-                    Runbook                      : workerRunbookLink()
+                String failureTarget = resolveWorkerAiSummaryTarget()
+                sendSlackNotification(workerFailureTitle(env.DEPLOY_PHASE, failureTarget), [
+                    '핵심 상태' : slackSection([
+                        Build      : "#${env.BUILD_NUMBER}",
+                        Result     : 'FAILED',
+                        '실패 대상' : failureTarget,
+                        '실패 단계' : env.DEPLOY_PHASE,
+                        'Free Update': executedText(env.FREE_UPDATE_REQUESTED),
+                        'Paid Update': executedText(env.PAID_UPDATE_REQUESTED)
+                    ]),
+                    '배포 정보' : slackSection([
+                        Image       : shortImageTag(env.IMAGE_URI),
+                        Commit      : shortSha(env.GIT_COMMIT_SHA ?: env.GIT_SHORT_SHA),
+                        'Free Service': env.FREE_ECS_SERVICE_NAME,
+                        'Paid Service': env.PAID_ECS_SERVICE_NAME
+                    ]),
+                    '링크' : slackSection([
+                        Jenkins: env.BUILD_URL,
+                        Runbook: workerRunbookLink()
+                    ])
                 ] + trivySlackDetails('worker'))
 
                 if (env.DEPLOY_PHASE == 'DEPLOY_SUCCESS') {
@@ -1938,24 +2011,31 @@ PY
                                 'REQUESTED_REVISION_STILL_ACTIVE' : 'EXTERNAL_OR_UNEXPECTED_REVISION')) :
                         (env.PAID_FINAL_TASK_DEFINITION_ARN == env.PAID_PREVIOUS_TASK_DEFINITION_ARN ?
                             'NOT_REQUIRED_PAID_NOT_DEPLOYED' : 'UNEXPECTED_REVISION_CHANGE')
-                    sendSlackNotification(':warning: Worker rollback result', [
-                        Scenario                         : rollbackScenario,
-                        'Rollback Result'                : env.WORKER_ROLLBACK_RESULT,
-                        'Free Rollback Result'           : freeRollbackResult,
-                        'Free Requested Revision'        : env.FREE_TASK_DEFINITION_ARN,
-                        'Free Baseline Revision'         : env.FREE_PREVIOUS_TASK_DEFINITION_ARN,
-                        'Free Final Revision'            : env.FREE_FINAL_TASK_DEFINITION_ARN,
-                        'Free Baseline Restored'         : env.FREE_FINAL_TASK_DEFINITION_ARN == env.FREE_PREVIOUS_TASK_DEFINITION_ARN,
-                        'Free Compensating Rollback'     : env.PAID_UPDATE_REQUESTED == 'true',
-                        'Paid Rollback Result'           : paidRollbackResult,
-                        'Paid Requested Revision'        : env.PAID_TASK_DEFINITION_ARN,
-                        'Paid Baseline Revision'         : env.PAID_PREVIOUS_TASK_DEFINITION_ARN,
-                        'Paid Final Revision'            : env.PAID_FINAL_TASK_DEFINITION_ARN,
-                        'Paid Baseline Restored'         : env.PAID_FINAL_TASK_DEFINITION_ARN == env.PAID_PREVIOUS_TASK_DEFINITION_ARN,
-                        'Paid Deployment Started'        : env.PAID_UPDATE_REQUESTED,
-                        'Deploy Phase'                   : env.DEPLOY_PHASE,
-                        'Jenkins Build URL'              : env.BUILD_URL,
-                        Runbook                          : workerRunbookLink()
+                    sendSlackNotification(':warning: Worker Rollback 결과 - baseline 복구 확인', [
+                        '복구 결과' : slackSection([
+                            Result                 : env.WORKER_ROLLBACK_RESULT,
+                            'Free rollback'        : freeRollbackResult,
+                            'Paid rollback'        : paidRollbackResult,
+                            'Free compensating'    : yesNo(env.PAID_UPDATE_REQUESTED == 'true'),
+                            'Paid deployment started': yesNo(env.PAID_UPDATE_REQUESTED)
+                        ]),
+                        'Free Revision' : slackSection([
+                            Requested: shortTaskDefinition(env.FREE_TASK_DEFINITION_ARN),
+                            Baseline : shortTaskDefinition(env.FREE_PREVIOUS_TASK_DEFINITION_ARN),
+                            Final    : shortTaskDefinition(env.FREE_FINAL_TASK_DEFINITION_ARN)
+                        ]),
+                        'Paid Revision' : slackSection([
+                            Requested: shortTaskDefinition(env.PAID_TASK_DEFINITION_ARN),
+                            Baseline : shortTaskDefinition(env.PAID_PREVIOUS_TASK_DEFINITION_ARN),
+                            Final    : shortTaskDefinition(env.PAID_FINAL_TASK_DEFINITION_ARN)
+                        ]),
+                        '판단' : env.PAID_UPDATE_REQUESTED == 'true' ?
+                            'Paid 실패 이후 Free/Paid release 일관성을 위해 Free 보상 rollback까지 확인했습니다.' :
+                            'Free는 baseline으로 복구되었고, Paid는 배포 전 상태를 유지했습니다.',
+                        '링크' : slackSection([
+                            Jenkins: env.BUILD_URL,
+                            Runbook: workerRunbookLink()
+                        ])
                     ])
                 }
                 generateWorkerAiFailureSummary()
