@@ -72,8 +72,9 @@ def sendSlackNotification(String title, Map details) {
     String payloadFile = ".slack-payload-${env.BUILD_NUMBER ?: 'unknown'}.json"
     try {
         String body = ([title] + details.collect { key, value ->
-            "*${key}:* ${slackDisplay(value)}"
-        }).join('\n')
+            String displayValue = slackDisplay(value)
+            displayValue.contains('\n') ? "*${key}:*\n${displayValue}" : "*${key}:* ${displayValue}"
+        }).join('\n\n')
         writeFile(file: messageFile, text: body)
         withCredentials([
             string(credentialsId: 'slack-webhook-url', variable: 'SLACK_WEBHOOK_URL')
