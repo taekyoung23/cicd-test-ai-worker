@@ -419,7 +419,7 @@ Free Worker와 Paid Worker는 별도 ECS Service, 별도 SQS Queue, 별도 DLQ�
 - Free rollback result 확인
 - Paid가 미배포 상태인지 확인
 - stopped reason과 CloudWatch Logs 기반 원인 수정
-- 수동 복구가 필요하면 `Worker 수동 Rollback Runbook`으로 이동
+- 수동 복구가 필요하면 [Worker 수동 Rollback Runbook](./worker-manual-rollback-runbook.md)으로 이동
 
 #### 재시도 기준
 
@@ -456,7 +456,7 @@ Free Worker와 Paid Worker는 별도 ECS Service, 별도 SQS Queue, 별도 DLQ�
 - Paid rollback result 확인
 - Free compensating rollback result 확인
 - Free/Paid final revision이 baseline인지 확인
-- 수동 복구가 필요하면 `Worker 수동 Rollback Runbook`으로 이동
+- 수동 복구가 필요하면 [Worker 수동 Rollback Runbook](./worker-manual-rollback-runbook.md)으로 이동
 
 #### 재시도 기준
 
@@ -484,7 +484,7 @@ Free Worker와 Paid Worker는 별도 ECS Service, 별도 SQS Queue, 별도 DLQ�
 
 #### 조치 방법
 
-- `Worker 수동 Rollback Runbook`에 따라 Free Service를 정상 revision으로 복구
+- [Worker 수동 Rollback Runbook](./worker-manual-rollback-runbook.md)에 따라 Free Service를 정상 revision으로 복구
 
 #### 재시도 기준
 
@@ -511,7 +511,7 @@ Free Worker와 Paid Worker는 별도 ECS Service, 별도 SQS Queue, 별도 DLQ�
 
 #### 조치 방법
 
-- `Worker 수동 Rollback Runbook`에 따라 Paid Service를 정상 revision으로 복구
+- [Worker 수동 Rollback Runbook](./worker-manual-rollback-runbook.md)에 따라 Paid Service를 정상 revision으로 복구
 
 #### 재시도 기준
 
@@ -538,7 +538,7 @@ Free Worker와 Paid Worker는 별도 ECS Service, 별도 SQS Queue, 별도 DLQ�
 
 #### 조치 방법
 
-- `Worker 수동 Rollback Runbook`에 따라 Free/Paid 정상 revision 조합으로 수동 복구
+- [Worker 수동 Rollback Runbook](./worker-manual-rollback-runbook.md)에 따라 Free/Paid 정상 revision 조합으로 수동 복구
 
 #### 재시도 기준
 
@@ -813,7 +813,7 @@ Free Worker와 Paid Worker는 별도 ECS Service, 별도 SQS Queue, 별도 DLQ�
 
 수동 복구가 필요한 경우 아래 절차형 Runbook을 따른다.
 
-- Worker 수동 Rollback Runbook: `docs/runbooks/worker-manual-rollback-runbook.md`
+- [Worker 수동 Rollback Runbook](./worker-manual-rollback-runbook.md)
 
 ## 6. SQS / DLQ 상세 장애 대응
 
@@ -909,7 +909,7 @@ Free Worker와 Paid Worker는 별도 ECS Service, 별도 SQS Queue, 별도 DLQ�
 9. SQS Queue 적체 확인
 10. DLQ 유입 확인
 11. Rollback Result 확인
-12. 수동 복구가 필요하면 `Worker 수동 Rollback Runbook`으로 이동
+12. 수동 복구가 필요하면 [Worker 수동 Rollback Runbook](./worker-manual-rollback-runbook.md)으로 이동
 13. SQS/DLQ 장애는 메시지 재처리 전 담당자 승인
 
 주의:

@@ -64,7 +64,7 @@ def workerFailureTitle(String phase, String target) {
 }
 
 def workerRunbookLink() {
-    return '<https://github.com/taekyoung23/cicd-test-ai-worker/blob/ktk-cicd/docs/runbooks/worker-deployment-runbook.md|운영 가이드>'
+    return '<https://github.com/taekyoung23/cicd-test-ai-worker/blob/ktk-cicd/docs/runbooks/worker-deployment-operations-runbook.md|운영 가이드>'
 }
 
 def sendSlackNotification(String title, Map details) {
